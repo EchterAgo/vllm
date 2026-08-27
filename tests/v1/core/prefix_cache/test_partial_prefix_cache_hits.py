@@ -188,6 +188,7 @@ def test_dcp_fine_hit_retention_uses_hash_alignment(
     scheduler = SimpleNamespace(
         block_size=block_size * dcp_world_size,
         cache_config=SimpleNamespace(block_size=block_size),
+        mamba_state_block_size=block_size,
         hash_block_size=hash_block_size,
         max_num_scheduled_tokens=8192,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
@@ -245,6 +246,7 @@ def test_mamba_align_split_partial_tail_schedule(dcp_world_size: int):
     mock = SimpleNamespace(
         block_size=scheduler_block_size,
         cache_config=SimpleNamespace(block_size=block_size),
+        mamba_state_block_size=block_size,
         max_num_scheduled_tokens=8192,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
         use_eagle_block_drop=False,
@@ -296,6 +298,7 @@ def test_mamba_align_split_when_block_exceeds_scheduling_budget():
     mock = SimpleNamespace(
         block_size=block_size,
         cache_config=SimpleNamespace(block_size=block_size),
+        mamba_state_block_size=block_size,
         max_num_scheduled_tokens=token_budget,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
         use_eagle_block_drop=False,
@@ -336,6 +339,7 @@ def test_mamba_align_split_when_block_exceeds_long_prefill_threshold():
     mock = SimpleNamespace(
         block_size=block_size,
         cache_config=SimpleNamespace(block_size=block_size),
+        mamba_state_block_size=block_size,
         max_num_scheduled_tokens=token_budget,
         scheduler_config=SimpleNamespace(
             long_prefill_token_threshold=long_prefill_threshold
@@ -1988,6 +1992,7 @@ def test_mamba_align_split_stops_below_eagle_proof_boundary():
     hash_block_size = 128
     mock = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=block_size),
+        mamba_state_block_size=block_size,
         max_num_scheduled_tokens=8192,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
         use_eagle=True,
