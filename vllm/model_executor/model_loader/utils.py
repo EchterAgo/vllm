@@ -189,9 +189,23 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
             if name in uva_offloaded_parameters and not getattr(
                 p, "_vllm_is_uva_offloaded", False
             ):
+                # The parameter is being re-offloaded after post-processing
+                # replaced it (Marlin repack).  Release the mapping the FIRST
+                # offload created, or both copies stay resident.
+                _stale_ptr = p.data.data_ptr()
                 cpu_data = p.data.to(device="cpu")
                 if use_pin_memory:
-                    cpu_data = cpu_data.pin_memory()
+                    # Exact-size pinning (see offloader.base.pin_exact). This is
+                    # the RE-offload after process_weights_after_loading swapped
+                    # the offloaded tensor for a new device tensor (e.g. a Marlin
+                    # repack), so without this the power-of-two rounding is paid
+                    # a SECOND time, on top of the initial offload.
+                    from vllm.model_executor.offloader.base import pin_exact
+
+                    cpu_data = pin_exact(cpu_data)
+                    from vllm.model_executor.offloader.base import release_pinned
+
+                    release_pinned(_stale_ptr)
                 p.data = get_accelerator_view_from_cpu_tensor(cpu_data)
                 p._vllm_is_uva_offloaded = True
 

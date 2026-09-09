@@ -32,6 +32,99 @@ def should_pin_memory() -> bool:
     )
 
 
+# Anonymous mmaps backing exact-size pinned tensors, held for the process
+# lifetime.  See pin_exact() -- these back model weights, which live as long as
+# the model does; releasing them early un-maps memory CUDA still has registered.
+_PINNED_MAPPINGS: dict[int, object] = {}
+
+
+def pin_exact(t: "torch.Tensor") -> "torch.Tensor":
+    """Return a page-locked copy of ``t`` occupying EXACTLY its own size.
+
+    ``Tensor.pin_memory()`` allocates through torch's ``CachingHostAllocator``,
+    which rounds every block up to the next power of two.  For the large,
+    awkwardly-sized tensors weight offloading deals with that is not a rounding
+    error but a multiplier: a 2.250 GiB expert block costs 4.008 GiB of pinned
+    host memory (measured 1.78x, torch 2.13.0+cu130).  Offloading a MoE's experts
+    therefore needs ~1.78x the host RAM the weights occupy and the process is
+    OOM-killed during construction, long before ``cpu_offload_gb`` is reached.
+    (For reference, llama.cpp pins the same class of weights at ~1.0x.)
+
+    An anonymous mmap is page-aligned by construction and exactly sized;
+    registering it with ``cudaHostRegister`` yields page-locked memory with no
+    bucketing.  Falls back to ``pin_memory()`` if registration is unavailable.
+    """
+    import mmap
+
+    import torch
+
+    nbytes = t.numel() * t.element_size()
+    if nbytes == 0 or not t.is_contiguous():
+        # Non-contiguous inputs would need the strided layout rebuilt over the
+        # mapping; not worth it -- these are small next to the expert blocks.
+        return t.pin_memory()
+
+    buf = None
+    try:
+        buf = mmap.mmap(-1, nbytes)
+        # Build the tensor at its final dtype/shape directly -- no uint8->dtype
+        # ->shape view chain, whose intermediate bases confuse downstream code
+        # that inspects storage_offset()/is_contiguous().
+        out = torch.frombuffer(buf, dtype=t.dtype, count=t.numel()).view(t.shape)
+        # Register the WHOLE mapping (mmap rounds up to a page), not just nbytes.
+        rc = torch.cuda.cudart().cudaHostRegister(out.data_ptr(), len(buf), 0)
+        if int(rc) != 0:
+            raise RuntimeError(f"cudaHostRegister returned {rc}")
+        out.copy_(t)
+        # ⚠️ LIFETIME: the mapping must outlive every view of it.  Attaching the
+        # mmap to the returned tensor is NOT enough -- callers reassign
+        # ``param.data`` and drop this object, the mmap is munmapped while still
+        # CUDA-registered, and the next copy fails with cudaErrorInvalidValue.
+        # Offloaded weights live for the life of the model, so hold a process-
+        # level reference keyed by pointer.
+        _PINNED_MAPPINGS[out.data_ptr()] = buf
+        return out
+    except Exception as e:  # pragma: no cover - platform fallback
+        if buf is not None:
+            try:
+                buf.close()
+            except Exception:
+                pass
+        logger.warning_once(
+            "pin_exact() unavailable (%s); falling back to Tensor.pin_memory(), "
+            "which rounds allocations up to the next power of two.", e
+        )
+        return t.pin_memory()
+
+
+def release_pinned(ptr: int) -> bool:
+    """Unregister and unmap an exact-size pinned buffer created by pin_exact().
+
+    ⚠️ Callers that REPLACE an offloaded parameter must call this with the old
+    ``data_ptr()``.  ``process_weights_after_loading`` repacks expert weights
+    (e.g. for Marlin), so the same logical parameter is offloaded twice; without
+    releasing the first mapping both copies are held and the process needs
+    roughly double the host RAM.  ``Tensor.pin_memory()`` gets this for free --
+    its caching allocator recycles the block when the old tensor dies -- so the
+    exact-size path has to do the recycling explicitly.
+    """
+    import torch
+
+    buf = _PINNED_MAPPINGS.pop(ptr, None)
+    if buf is None:
+        return False
+    try:
+        torch.cuda.cudart().cudaHostUnregister(ptr)
+    except Exception:  # pragma: no cover
+        pass
+    try:
+        buf.close()
+    except Exception:  # pragma: no cover
+        pass
+    return True
+
+
+
 """
 class relation:
 
