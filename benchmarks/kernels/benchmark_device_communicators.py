@@ -54,7 +54,10 @@ logger = init_logger(__name__)
 # Default sequence lengths to benchmark
 DEFAULT_SEQUENCE_LENGTHS = [16, 64, 128, 512, 1024, 2048, 4096, 8192]
 
-# Fixed hidden size and dtype for all benchmarks
+# Hidden size and dtype for all benchmarks. 8192 is only a default: a model's
+# real hidden size decides the payload, and the payload decides the launch
+# grid (custom_all_reduce.cuh:268 gives one CTA per 512 packs), so benchmarking
+# the wrong width can measure a different grid than serving runs.
 HIDDEN_SIZE = 8192
 BENCHMARK_DTYPE = torch.bfloat16
 
@@ -599,6 +602,8 @@ def print_results(
 
 
 def main():
+    global HIDDEN_SIZE
+
     parser = FlexibleArgumentParser(description="Benchmark device communicators")
 
     parser.add_argument(
@@ -607,6 +612,13 @@ def main():
         nargs="+",
         default=DEFAULT_SEQUENCE_LENGTHS,
         help="Sequence lengths to benchmark (tensor shape: seq_len x hidden_size)",
+    )
+
+    parser.add_argument(
+        "--hidden-size",
+        type=int,
+        default=HIDDEN_SIZE,
+        help="Model hidden size; take it from the checkpoint's config.json",
     )
 
     parser.add_argument(
@@ -620,6 +632,7 @@ def main():
     parser.add_argument("--output-json", type=str, help="Output results to JSON file")
 
     args = parser.parse_args()
+    HIDDEN_SIZE = args.hidden_size
 
     # Initialize distributed
     if not dist.is_initialized():

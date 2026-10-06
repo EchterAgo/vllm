@@ -52,7 +52,24 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
         logits.const_data_ptr<float>(), lengths.const_data_ptr<int32_t>(),
         output.mutable_data_ptr<int32_t>(), stride,
         static_cast<int>(std::min(max_seq_len, logits.size(1))));
-  } else if (num_rows > 32 && max_smem_per_block >= 128 * 1024) {
+  } else if ((num_rows > 32 ||
+              static_cast<uint32_t>(max_seq_len) <= P::RADIX_THRESHOLD) &&
+             max_smem_per_block >= 128 * 1024) {
+    // FilteredTopK is one CTA per row with no inter-CTA coordination, so the
+    // persistent path can only beat it where a row is long enough to engage the
+    // multi-CTA radix path. Below RADIX_THRESHOLD every row is handled by CTA-0
+    // alone while its siblings early-exit, and it also pays an extra memset node
+    // for RadixRowState that FilteredTopK does not need. Measured on A100 at
+    // k=512 with a single live row (batch-1 decode, us, cudagraph replay):
+    //
+    //   n           512   2048   8192  12000  26750 | 32769  65536  131072
+    //   persistent 5.60  12.54  16.27  15.78  24.48 | 29.07  28.90   29.41
+    //   filtered   1.58   4.08   6.60   8.02  13.07 | 27.59  35.78   50.38
+    //
+    // i.e. 1.9-3.6x in favour of FilteredTopK up to RADIX_THRESHOLD and against
+    // it above, which is where this predicate puts the boundary. `max_seq_len`
+    // bounds every row's length -- the kernel already relies on that for its own
+    // early-exit -- so it is a safe stand-in for the per-row check.
     cudaError_t status =
         vllm::FilteredTopKRaggedTransform<float, int32_t, TopK>(
             logits.const_data_ptr<float>(), output.mutable_data_ptr<int32_t>(),
@@ -95,6 +112,11 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
     uint32_t ctas_per_group =
         (static_cast<uint32_t>(stride) + max_chunk_elements - 1) /
         max_chunk_elements;
+    // The deterministic collection publishes per-CTA counts into one
+    // 256-entry histogram buffer of RadixRowState.
+    STD_TORCH_CHECK(ctas_per_group <= 256,
+                    "persistent_topk: ctas_per_group=", ctas_per_group,
+                    " exceeds the 256-slot per-CTA counts buffer");
     uint32_t chunk_size =
         (static_cast<uint32_t>(stride) + ctas_per_group - 1) / ctas_per_group;
     chunk_size = ((chunk_size + vec_size - 1) / vec_size) * vec_size;

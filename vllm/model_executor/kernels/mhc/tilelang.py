@@ -5,6 +5,18 @@ import torch
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import direct_register_custom_op
 
+# Below this many tokens the one-CTA-per-token tilelang kernel wins on launch
+# latency (7.0 us at T=1 vs 10.5 for cuBLAS); the measured crossover is T=32.
+_PRENORM_SMALL_T = 32
+# The prenorm GEMM is L2-bound on re-reads of `fn`, not CUDA-core bound, so the
+# tilelang fusion loses to cuBLAS + a separate one-pass sqrsum at every size
+# worth splitting (17.4 us at T=64, 85 at T=2048 vs 26.2 / 442 for the best
+# fused tilelang config); the tilelang route stays as the escape hatch.
+_PRENORM_USE_CUBLAS = True
+# Threads per row in the tilelang prenorm kernels: a row whose length is not a
+# multiple of this cannot be tiled by them at all.
+_PRENORM_N_THR = 512
+
 
 def _hc_prenorm_gemm_outputs(
     x: torch.Tensor,
@@ -42,6 +54,35 @@ def _hc_prenorm_gemm_outputs(
     )
     if use_deep_gemm:
         tf32_hc_prenorm_gemm(x, fn, out, sqrsum, n_splits)
+    elif n_splits == 1 and x.shape[0] < _PRENORM_SMALL_T and x.shape[1] % 1024 == 0:
+        # Launch-latency regime: the fused tilelang kernel beats cuBLAS below
+        # the measured crossover, and keeps fp32 `fn` numerics.
+        from vllm.model_executor.kernels.mhc.tilelang_kernels import (
+            hc_prenorm_gemm_tilelang,
+        )
+
+        hc_prenorm_gemm_tilelang(
+            x,
+            fn,
+            out,
+            sqrsum,
+            hidden_size,
+            hc_mult,
+            fn.shape[0],
+            1024,
+            4,
+            n_splits,
+        )
+    elif n_splits == 1 and x.dtype == torch.bfloat16 and _PRENORM_USE_CUBLAS:
+        # 17.4 us at T=64, 85 us at T=2048 vs 26.2 / 442 for the best fused
+        # tilelang config (8, 6).
+        from vllm.model_executor.kernels.mhc.triton import hc_prenorm_gemm_cublas
+
+        hc_prenorm_gemm_cublas(x, fn, out, sqrsum)
+    elif n_splits == 1 and x.shape[1] % _PRENORM_N_THR != 0:
+        # Shape the tilelang kernels cannot tile; the prenorm GEMM output is
+        # tiny ([T, hc_mult3] + [T]), so torch is a cheap universal fallback.
+        _torch_hc_prenorm_gemm(x, fn, out, sqrsum)
     else:
         from vllm.model_executor.kernels.mhc.tilelang_kernels import (
             _HC_PRENORM_GEMM_TILELANG_KERNEL,

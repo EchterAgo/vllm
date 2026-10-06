@@ -10,6 +10,7 @@ from typing import Any
 
 import torch
 
+import vllm.envs as envs
 from vllm.model_executor.warmup.jit_warmup import WarmupIntRange, zip_inputs
 from vllm.model_executor.warmup.jit_warmup_tilelang_helper import (
     TileLangLaunchSpec,
@@ -43,6 +44,16 @@ def _is_collapse_thread():
 
 @cache
 def compute_num_split(block_k: int, k: int | None, grid_size: int) -> int:
+    fixed = envs.VLLM_MHC_FIXED_NUM_SPLIT
+    if fixed > 0:
+        # Batch-invariant mode: grid_size tracks the batch token count, so the
+        # occupancy-derived split factor (and with it the reduction order of
+        # every token's mHC GEMM) changes with batch composition. Pin it,
+        # keeping only the k-based clamp, which is constant per call site.
+        split_k = fixed
+        if k is not None:
+            split_k = min(split_k, max(1, cdiv(k, block_k) // 4))
+        return max(split_k, 1)
     device_props = torch.cuda.get_device_properties(0)
     n_sms = device_props.multi_processor_count
     split_k = n_sms // grid_size
