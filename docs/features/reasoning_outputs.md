@@ -275,13 +275,16 @@ To use this feature:
 
 If `thinking_token_budget` is not specified, no explicit reasoning limit is applied beyond normal generation constraints such as `max_tokens`.
 
+To apply a limit to every request without each client having to set it, configure `default_thinking_token_budget` in `--reasoning-config`. It is used only for requests that do not pass `thinking_token_budget` themselves; a request-level value always takes priority. Set it to `-1` (or omit it) to keep the default unlimited.
+
 `--reasoning-config` accepts a JSON object corresponding to  
 [ReasoningConfig][vllm.config.ReasoningConfig] with the following fields:
 
-| Field                 | Type           | Description                                      |
-|-----------------------|----------------|--------------------------------------------------|
-| `reasoning_start_str` | `str \| null`  | String that marks the start of reasoning content |
-| `reasoning_end_str`   | `str \| null`  | String that marks the end of reasoning content   |
+| Field                            | Type             | Description                                                        |
+|----------------------------------|------------------|--------------------------------------------------------------------|
+| `reasoning_start_str`            | `str \| null`    | String that marks the start of reasoning content                   |
+| `reasoning_end_str`              | `str \| null`    | String that marks the end of reasoning content                     |
+| `default_thinking_token_budget`  | `int \| null`    | Server-wide default `thinking_token_budget` for requests that omit it (`-1`/`null` = unlimited) |
 
 !!! note
     `reasoning_end_str` can include a transition phrase before the reasoning end token. For example, setting `reasoning_end_str` to `"I have to give the solution based on the reasoning directly now.</think>"` instructs the model to emit that phrase when the budget is exhausted, making the reasoning termination more natural.
@@ -291,8 +294,10 @@ If `thinking_token_budget` is not specified, no explicit reasoning limit is appl
 ```bash
 vllm serve Qwen/Qwen3-0.6B \
     --reasoning-parser qwen3 \
-    --reasoning-config '{"reasoning_start_str": "<think>", "reasoning_end_str": "I have to give the solution based on the reasoning directly now.</think>"}'
+    --reasoning-config '{"reasoning_start_str": "<think>", "reasoning_end_str": "I have to give the solution based on the reasoning directly now.</think>", "default_thinking_token_budget": 10}'
 ```
+
+With `default_thinking_token_budget` set, requests that omit `thinking_token_budget` are capped at 10 reasoning tokens; a request can still override it by passing its own `thinking_token_budget`.
 
 Then make a request with `thinking_token_budget` to limit the reasoning tokens:
 
@@ -319,6 +324,7 @@ llm = LLM(
     reasoning_config=ReasoningConfig(
         reasoning_start_str="<think>",
         reasoning_end_str="I have to give the solution based on the thinking directly now.</think>",
+        default_thinking_token_budget=10,
     ),
 )
 
