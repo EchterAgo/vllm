@@ -67,6 +67,12 @@ class SharedExperts(torch.nn.Module):
             lora_config is not None and lora_config.fully_sharded_loras
         )
 
+        # ROCm launches shared experts before routed dispatch and syncs through
+        # CUDA events (vllm#52033). On CUDA that launch does not overlap under
+        # breakable CUDA graphs (the shared-expert kernels replay inline with
+        # the routed experts), so CUDA syncs the aux stream up front and runs
+        # the shared experts on it after the routed experts are enqueued.
+        self._async_launch = current_platform.is_rocm()
         # Allow disabling of the separate shared experts stream for
         # debug purposes.
         # TODO: Remove this after more extensive testings with TP/DP
@@ -145,7 +151,7 @@ class SharedExperts(torch.nn.Module):
         Returns true if the shared experts were enqueued, false otherwise. Call
         `wait` to wait for the shared experts to finish if this returns true.
         """
-        if (
+        if not self._async_launch or (
             self._determine_shared_experts_order(shared_experts_input)
             != SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
         ):
@@ -159,6 +165,22 @@ class SharedExperts(torch.nn.Module):
             self._output[idx] = self._layer(shared_experts_input)
             self._output_ready_event[idx].record(self._stream)
         return True
+
+    def maybe_sync_shared_experts_stream(self, shared_experts_input: torch.Tensor):
+        """Mark the aux stream's start point for a later overlapped `forward`.
+
+        The shared experts then run on the aux stream in parallel with the
+        router and routed experts enqueued on the main stream after this call.
+        """
+        if self._async_launch or (
+            self._determine_shared_experts_order(shared_experts_input)
+            != SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
+        ):
+            return
+        assert self._stream is not None
+        # The aux stream consumes the input; keep its block alive for it.
+        shared_experts_input.record_stream(self._stream)
+        self._stream.wait_stream(current_stream())
 
     def wait(self) -> None:
         """Block the main stream until `maybe_forward_async` output is ready."""
@@ -188,6 +210,13 @@ class SharedExperts(torch.nn.Module):
 
         assert self._output[self._output_idx] is None
 
-        self._output[self._output_idx] = self._layer(shared_experts_input)
+        if order == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED:
+            assert self._stream is not None and not self._async_launch
+            with torch.cuda.stream(self._stream):
+                output = self._layer(shared_experts_input)
+            current_stream().wait_stream(self._stream)
+            self._output[self._output_idx] = output
+        else:
+            self._output[self._output_idx] = self._layer(shared_experts_input)
 
         assert self._output[self._output_idx] is not None
