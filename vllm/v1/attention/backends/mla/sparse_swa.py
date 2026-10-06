@@ -171,7 +171,12 @@ class DeepseekSparseSWABackend(AttentionBackend):
 
     @staticmethod
     def get_builder_cls() -> type["DeepseekSparseSWAMetadataBuilder"]:
-        if current_platform.is_rocm():
+        # ROCm and CUDA SM8x share the ragged Triton decode kernels, which
+        # consume the ragged SWA metadata this builder adds.
+        if current_platform.is_rocm() or (
+            current_platform.is_cuda()
+            and not current_platform.has_device_capability(90)
+        ):
             from vllm.models.deepseek_v4.amd.rocm import (
                 DeepseekV4ROCMAiterSparseSWAMetadataBuilder,
             )
@@ -931,6 +936,12 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             or current_platform.is_rocm()
             or current_platform.is_xpu()
             or current_platform.is_device_capability_family(120)
+            # CUDA SM8x shares the ROCm ragged Triton decode kernels (see
+            # get_builder_cls) and never calls flash_mla_with_kvcache.
+            or (
+                current_platform.is_cuda()
+                and not current_platform.has_device_capability(90)
+            )
         ):
             return out
         for layer_type in self._layer_types:

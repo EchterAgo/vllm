@@ -845,6 +845,12 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         assert swa_indices is not None
         assert swa_lens is not None
         q = self._prepare_query(q, output)
+        # FlashInfer's SM120 sparse MLA TVM-FFI entry (0.6.18rc8, top-k 192/256
+        # DSV4 decode specialisations) requires contiguous index tensors.
+        if extra_sparse_indices is not None:
+            extra_sparse_indices = extra_sparse_indices.contiguous()
+        if not swa_indices.is_contiguous():
+            swa_indices = swa_indices.contiguous()
         swa_cache = self._as_sparse_cache(self.swa_cache_layer.kv_cache)
         extra_cache = self._as_sparse_cache(kv_cache) if kv_cache is not None else None
         if extra_cache is not None and extra_sparse_indices is None:

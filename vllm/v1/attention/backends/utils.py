@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import functools
 import math
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Sequence
@@ -39,6 +40,8 @@ from vllm.distributed.kv_transfer.kv_connector.utils import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.platforms import current_platform
+from vllm.triton_utils import HAS_TRITON, tl, triton
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionImpl,
