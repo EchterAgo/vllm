@@ -528,3 +528,40 @@ def test_logits_cache_narrower_than_logits_is_rejected():
             logits_cache=cache,
             logits_cache_col=torch.tensor(0, dtype=torch.int32, device=DEVICE),
         )
+
+
+@pytest.mark.parametrize("pattern", ["all_neg_inf", "all_nan", "nan_tail"])
+def test_degenerate_rows_never_sample_out_of_vocab(pattern: str):
+    """
+    Guard against vllm-project/vllm#50843: the tile-local argmax pads
+    out-of-vocab lanes with -inf; on degenerate rows (all -inf / NaN) the
+    NaN-blind Triton max can settle on a padding lane. The clamp must keep
+    every sampled id addressable.
+    """
+    vocab_size = 4097  # not a multiple of BLOCK_SIZE: last tile has pad lanes
+    n = 4
+    if pattern == "all_neg_inf":
+        logits = torch.full((n, vocab_size), float("-inf"), device=DEVICE)
+    elif pattern == "all_nan":
+        logits = torch.full((n, vocab_size), float("nan"), device=DEVICE)
+    else:
+        logits = torch.full((n, vocab_size), float("-inf"), device=DEVICE)
+        logits[:, 4096:] = float("nan")
+
+    idx_mapping = torch.zeros(n, dtype=torch.int32, device=DEVICE)
+    temp = torch.tensor([1.0], dtype=torch.float32, device=DEVICE)
+    seed = torch.tensor([0xABCD], dtype=torch.int64, device=DEVICE)
+    pos = torch.arange(n, dtype=torch.int64, device=DEVICE)
+
+    sampled = gumbel_sample(
+        logits,
+        idx_mapping,
+        temp,
+        seed,
+        pos,
+        apply_temperature=True,
+        is_drafting=False,
+    )
+    assert sampled.min() >= 0 and sampled.max() < vocab_size, (
+        f"out-of-vocab ids sampled: {sampled.tolist()}"
+    )

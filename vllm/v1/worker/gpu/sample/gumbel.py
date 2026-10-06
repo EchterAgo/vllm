@@ -336,7 +336,13 @@ def _gumbel_sample_kernel(
         USE_FP64=USE_FP64,
         PER_TOKEN_COL=PER_TOKEN_COL,
     )
-    token_id = block_idx * BLOCK_SIZE + idx
+    # `idx` is the argmax over a BLOCK_SIZE-wide tile whose out-of-vocab tail
+    # lanes are loaded as -inf. When every in-vocab lane of the tile is also
+    # -inf/NaN the reduction can settle on a tail lane, giving token_id >=
+    # vocab_size. Nothing downstream bounds a sampled token id, so such an id
+    # can index tables out of range and kill the engine. Clamp: in that
+    # degenerate tile any index is equally arbitrary. (vllm-project/vllm#50843)
+    token_id = tl.minimum(block_idx * BLOCK_SIZE + idx, vocab_size - 1)
     tl.store(local_argmax_ptr + token_idx * local_argmax_stride + block_idx, token_id)
     tl.store(local_max_ptr + token_idx * local_max_stride + block_idx, value)
 
