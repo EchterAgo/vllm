@@ -12,6 +12,7 @@ import vllm.model_executor.layers.mhc as mhc_layers
 from vllm.model_executor.kernels.mhc.tilelang import (
     _torch_hc_prenorm_gemm,
     mhc_post_tilelang,
+    mhc_pre_broadcast_tilelang,
     mhc_pre_delayed_tilelang,
 )
 from vllm.model_executor.kernels.mhc.tilelang_kernels import (
@@ -126,15 +127,10 @@ def test_hc_collapse_preserves_weighted_residual_sum(
     expected = (pre.unsqueeze(-1) * x.float()).sum(dim=1).to(x.dtype)
     actual = hc_collapse_triton(x, pre)
     assert actual.is_contiguous()
-    # BF16 rounding only: ptxas <13.1 contracts the FP32 mix into FFMA despite
-    # enable_fp_fusion=False, so compare within a ULP and pin the exact cases below.
-    torch.testing.assert_close(actual, expected, atol=1.6e-2, rtol=1e-2)
+    atol, rtol = (0, 0) if (hc_mult, hidden_size) == (4, 5120) else (1.6e-2, 1e-2)
+    torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
     if num_tokens:
         torch.testing.assert_close(actual[0], x[0, -1], atol=0, rtol=0)
-    if num_tokens > 1 and hc_mult == 4:
-        torch.testing.assert_close(
-            actual[1], torch.zeros_like(actual[1]), atol=0, rtol=0
-        )
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
@@ -948,8 +944,10 @@ def hc_head_ref(
 @pytest.mark.parametrize("num_tokens", [1, 4, 8, 128])
 @pytest.mark.parametrize("hidden_size", [4096, 7168])
 @pytest.mark.parametrize("hc_mult", [4])
-@pytest.mark.parametrize("fused_norm", [False, True])
-def test_mhc_pre_tilelang(num_tokens, hidden_size, hc_mult, fused_norm):
+@pytest.mark.parametrize("fuse_norm", [False, True])
+def test_mhc_pre_tilelang(num_tokens, hidden_size, hc_mult, fuse_norm):
+    """``fuse_norm`` selects the RMSNorm-fused kernel, which is the variant
+    DeepSeek V4 actually runs (the model always passes ``norm_weight``)."""
     torch.set_default_device(DEVICE)
     set_random_seed(0)
 
@@ -967,8 +965,14 @@ def test_mhc_pre_tilelang(num_tokens, hidden_size, hc_mult, fused_norm):
     hc_sinkhorn_eps = hc_pre_eps = rms_eps = 1e-6
     sinkhorn_repeat = 20
     hc_post_alpha = 1.0
+    norm_eps = 1e-5
+    norm_weight = (
+        torch.randn((hidden_size,), dtype=torch.bfloat16) * 0.1 + 1.0
+        if fuse_norm
+        else None
+    )
 
-    ref = mhc_pre_ref(
+    post_mix_ref, res_mix_ref, layer_input_ref = mhc_pre_ref(
         residual,
         fn,
         hc_scale,
@@ -979,12 +983,14 @@ def test_mhc_pre_tilelang(num_tokens, hidden_size, hc_mult, fused_norm):
         hc_post_alpha,
         sinkhorn_repeat,
     )
-    norm_kwargs = {}
-    if fused_norm:
-        # Non-shifted mHC must still use its freshly computed pre-mix.
-        weight = torch.ones(hidden_size, dtype=torch.bfloat16)
-        norm_kwargs = dict(norm_weight=weight, norm_eps=rms_eps)
-        ref = (*ref[:2], F.rms_norm(ref[2], (hidden_size,), weight, rms_eps))
+    if norm_weight is not None:
+        li = layer_input_ref.float()
+        layer_input_ref = (
+            li
+            * torch.rsqrt(li.square().mean(-1, keepdim=True) + norm_eps)
+            * norm_weight.float()
+        ).bfloat16()
+
     out = torch.ops.vllm.mhc_pre_tilelang(
         residual,
         fn,
@@ -995,11 +1001,121 @@ def test_mhc_pre_tilelang(num_tokens, hidden_size, hc_mult, fused_norm):
         hc_sinkhorn_eps,
         hc_post_alpha,
         sinkhorn_repeat,
-        **norm_kwargs,
+        1,
+        norm_weight,
+        norm_eps,
     )
 
+    ref = (post_mix_ref, res_mix_ref, layer_input_ref)
     for actual, expected in zip(out, ref, strict=True):
         torch.testing.assert_close(actual, expected, atol=5e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(
+    not HAS_TILELANG_MHC,
+    reason="TileLang MHC support required",
+)
+@pytest.mark.parametrize("num_tokens", [1, 4, 8, 128])
+@pytest.mark.parametrize("hidden_size", [4096, 7168])
+@pytest.mark.parametrize("hc_mult", [4])
+def test_mhc_pre_broadcast_tilelang(num_tokens, hidden_size, hc_mult):
+    """First-layer variant: the (T, H) residual is broadcast across the
+    hc_mult streams, so the result must match ``mhc_pre_ref`` on the
+    explicitly expanded residual. RMSNorm fusion is mandatory here (the
+    wrapper asserts ``norm_weight``), matching how the model calls it."""
+    _run_mhc_pre_broadcast_case(num_tokens, hidden_size, hc_mult)
+
+
+@pytest.mark.skipif(
+    not HAS_TILELANG_MHC,
+    reason="TileLang MHC support required",
+)
+@pytest.mark.parametrize("num_tokens", [1, 8, 128])
+@pytest.mark.parametrize("hidden_size", [4096])
+@pytest.mark.parametrize("hc_mult", [4])
+def test_mhc_pre_broadcast_tilelang_without_deep_gemm(
+    num_tokens, hidden_size, hc_mult, monkeypatch
+):
+    """Same case with DeepGEMM forced unavailable.
+
+    The broadcast variant is the one that reaches the prenorm GEMM through a
+    separate branch from its two siblings, and on a pre-Hopper device the
+    DeepGEMM branch aborts in ``hyperconnection.hpp`` rather than returning
+    wrong numbers. Below SM90 this is what the test above already runs, so
+    the point of forcing it is coverage on hardware where DeepGEMM *is*
+    supported and the fallback would otherwise never execute.
+    """
+    monkeypatch.setattr(
+        "vllm.utils.deep_gemm.is_deep_gemm_supported", lambda *a, **kw: False
+    )
+    _run_mhc_pre_broadcast_case(num_tokens, hidden_size, hc_mult)
+
+
+def _run_mhc_pre_broadcast_case(num_tokens, hidden_size, hc_mult):
+    torch.set_default_device(DEVICE)
+    set_random_seed(0)
+
+    x = torch.randn((num_tokens, hidden_size), dtype=torch.bfloat16)
+    hc_mult2 = hc_mult * hc_mult
+    hc_mult3 = 2 * hc_mult + hc_mult2
+    fn = (
+        torch.randn((hc_mult3, hc_mult, hidden_size), dtype=torch.float)
+        * 1e-4
+        * (1 + torch.arange(hc_mult).mul(0.01).view(1, -1, 1))
+    ).flatten(1, 2)
+    # The model precomputes fn_broadcast this way in
+    # finalize_mhc_broadcast_weights: summing fn over the hc_mult axis is
+    # exactly the GEMM against a residual that is identical in every stream.
+    fn_broadcast = fn.view(hc_mult3, hc_mult, hidden_size).sum(dim=1)
+    hc_scale = torch.randn((3,), dtype=torch.float) * 0.1
+    hc_base = torch.randn((hc_mult3,), dtype=torch.float) * 0.1
+
+    hc_sinkhorn_eps = hc_pre_eps = rms_eps = 1e-6
+    sinkhorn_repeat = 20
+    hc_post_alpha = 1.0
+    norm_eps = 1e-5
+    norm_weight = torch.randn((hidden_size,), dtype=torch.bfloat16) * 0.1 + 1.0
+
+    residual_ref = x.unsqueeze(-2).expand(num_tokens, hc_mult, hidden_size)
+    post_mix_ref, res_mix_ref, layer_input_ref = mhc_pre_ref(
+        residual_ref,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_alpha,
+        sinkhorn_repeat,
+    )
+    li = layer_input_ref.float()
+    layer_input_ref = (
+        li
+        * torch.rsqrt(li.square().mean(-1, keepdim=True) + norm_eps)
+        * norm_weight.float()
+    ).bfloat16()
+
+    residual_out, post_mix, res_mix, layer_input = mhc_pre_broadcast_tilelang(
+        x,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_alpha,
+        sinkhorn_repeat,
+        1,
+        norm_weight,
+        norm_eps,
+        fn_broadcast=fn_broadcast,
+    )
+
+    # The materialized broadcast must be an exact copy of the input rows.
+    torch.testing.assert_close(residual_out, residual_ref.contiguous(), rtol=0, atol=0)
+    torch.testing.assert_close(post_mix, post_mix_ref, atol=5e-2, rtol=1e-2)
+    torch.testing.assert_close(res_mix, res_mix_ref, atol=5e-2, rtol=1e-2)
+    torch.testing.assert_close(layer_input, layer_input_ref, atol=5e-2, rtol=1e-2)
 
 
 @pytest.mark.skipif(
@@ -1009,20 +1125,34 @@ def test_mhc_pre_tilelang(num_tokens, hidden_size, hc_mult, fused_norm):
 @pytest.mark.parametrize(
     ("num_tokens", "hidden_size"),
     [
+        # T crosses the routing boundary (_PRENORM_SMALL_T = 32): below it the
+        # one-CTA-per-token tilelang kernel runs (fp32 fn, strict tolerance);
+        # at and above it the cuBLAS bf16 route runs, whose fn and output are
+        # rounded to bf16, bounded at rel 5e-3 directly on `out` — the
+        # downstream mhc_pre tolerance alone cannot distinguish bf16-fn
+        # rounding from a broken kernel.
         (1, 1280),
+        (31, 1280),
+        (32, 1280),
         (512, 1280),
         (2048, 1280),
         (1, 4096),
+        (31, 4096),
+        (32, 4096),
         (64, 4096),
         (512, 4096),
         (2048, 4096),
         (1, 7168),
+        (31, 7168),
+        (32, 7168),
         (64, 7168),
         (512, 7168),
         (2048, 7168),
     ],
 )
 def test_hc_prenorm_gemm_tilelang(num_tokens, hidden_size):
+    from vllm.model_executor.kernels.mhc.tilelang import _PRENORM_SMALL_T
+
     torch.set_default_device(DEVICE)
     set_random_seed(0)
 
@@ -1045,7 +1175,12 @@ def test_hc_prenorm_gemm_tilelang(num_tokens, hidden_size):
         hc_mult,
     )
 
-    torch.testing.assert_close(out, out_ref, atol=1e-5, rtol=1e-4)
+    if num_tokens < _PRENORM_SMALL_T:
+        torch.testing.assert_close(out, out_ref, atol=1e-5, rtol=1e-4)
+    else:
+        # bf16 fn plus bf16 GEMM output: rel 5e-3 against the tensor scale.
+        scale = float(out_ref.abs().max())
+        torch.testing.assert_close(out, out_ref, atol=5e-3 * scale, rtol=5e-3)
     torch.testing.assert_close(sqrsum, sqrsum_ref, atol=1e-2, rtol=1e-6)
 
 
