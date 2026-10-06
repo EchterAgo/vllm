@@ -1020,9 +1020,12 @@ def w8a8_triton_block_scaled_mm(
     assert len(block_size) == 2
     block_n, block_k = block_size[0], block_size[1]
 
-    # Triton cannot currently bind E8M0 scale tensors directly. Checkpoints
-    # with exponent-only UE8M0 scales (e.g. DeepSeek-V4) are decoded to fp32
-    # before launching the kernel.
+    # Triton cannot currently bind E8M0 scale tensors directly (on any
+    # platform: the JIT binder has no canonical dtype for them). DeepSeek-V4
+    # checkpoints store block scales in exponent-only E8M0 format, so decode
+    # them to fp32 before launching the kernel. On CUDA this path is reached
+    # on SM89, where the kernel selector prefers the native fp8 route over
+    # Marlin.
     if As.dtype == torch.float8_e8m0fnu:
         As = _upcast_e8m0_to_fp32(As).contiguous()
     if Bs.dtype == torch.float8_e8m0fnu:

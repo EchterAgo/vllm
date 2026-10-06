@@ -37,6 +37,7 @@ from vllm.model_executor.layers.fused_moe.utils import _resize_cache
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     get_marlin_input_dtype,
     get_marlin_workspace,
+    marlin_make_workspace_new,
     marlin_moe_intermediate_size,
     marlin_quant_input,
 )
@@ -579,6 +580,10 @@ class MarlinExpertsBase(mk.FusedMoEExpertsModular):
             or quant_config.use_int8_w8a16
             or quant_config.use_fp8_w8a16
         ), "Supports only {mxfp,nvfp,int}4_w4a16, int8_w8a16 or fp8_w8a16"
+        # Persistent Marlin workspace, allocated on first use (see
+        # marlin_workspace). Without it every expert call runs a fresh
+        # torch.zeros.
+        self._marlin_workspace: torch.Tensor | None = None
         self.input_dtype = get_marlin_input_dtype()
 
         super().__init__(
@@ -587,6 +592,27 @@ class MarlinExpertsBase(mk.FusedMoEExpertsModular):
             max_num_tokens=max_num_tokens,
             num_dispatchers=num_dispatchers,
         )
+
+    def marlin_workspace(self, device: torch.device) -> torch.Tensor:
+        """Workspace shared by every expert call on this device.
+
+        The Marlin workspace is a per-SM lock/counter array that the kernel
+        leaves back at zero, which is why every Marlin *linear* layer
+        allocates one in `process_weights_after_loading` and reuses it for the
+        lifetime of the process (see marlin_utils_fp8.py and
+        kernels/linear/scaled_mm/marlin.py, which passes `layer.workspace` on
+        every forward). The expert path was the only caller not doing that:
+        it left `workspace=None` and paid a `torch.zeros` per call.
+
+        Allocated on first use rather than in `__init__` because the device
+        is not known until a forward arrives. First use is a warmup forward,
+        so the address is fixed before any CUDA graph captures it.
+        """
+        ws = self._marlin_workspace
+        if ws is None or ws.device != device:
+            ws = marlin_make_workspace_new(device, 4)
+            self._marlin_workspace = ws
+        return ws
 
     @staticmethod
     def _supports_current_device() -> bool:
@@ -792,6 +818,7 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
                 intermediate_cache2=workspace13,
                 input_dtype=self.input_dtype,
                 mul_topk_weights_in_gemm2=not hooked,
+                workspace=self.marlin_workspace(hidden_states.device),
             )
             return
 
@@ -902,6 +929,7 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
             intermediate_cache13=workspace2,
             intermediate_cache2=workspace13,
             input_dtype=self.input_dtype,
+            workspace=self.marlin_workspace(hidden_states.device),
         )
 
     def moe_sum(
@@ -1028,4 +1056,5 @@ class BatchedMarlinExperts(MarlinExpertsBase):
             input_dtype=self.input_dtype,
             activation_func=activation_func,
             activation_config=self.activation_config,
+            workspace=self.marlin_workspace(hidden_states.device),
         )
