@@ -1563,8 +1563,14 @@ if _is_hip():
 
 if _is_cuda():
     ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))
+    # FA3 kernels only target SM90+; skip the target entirely when
+    # TORCH_CUDA_ARCH_LIST is restricted to older archs.
+    _arch_list = os.environ.get("TORCH_CUDA_ARCH_LIST", "")
+    _fa3_archs = not _arch_list.strip() or any(
+        int(m.group(1)) >= 9 for m in re.finditer(r"(\d+)\.\d+", _arch_list)
+    )
     if USE_PRECOMPILED_EXTENSIONS or (
-        CUDA_HOME and get_nvcc_cuda_version() >= Version("12.3")
+        CUDA_HOME and get_nvcc_cuda_version() >= Version("12.3") and _fa3_archs
     ):
         # FA3 requires CUDA 12.3 or later
         ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa3_C"))
