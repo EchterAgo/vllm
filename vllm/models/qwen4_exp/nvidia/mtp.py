@@ -158,6 +158,24 @@ def _make_draft_vllm_config(
                 "quantized_layers",
                 _remap_quantized_layers(quantized_layers, mtp_start_layer_idx),
             )
+        # compressed-tensors keeps its ignore list under `.ignore` as regex
+        # patterns. Checkpoints that leave MTP in bf16 (e.g. AWQ W4A16 exports,
+        # whose quantization_config ignores `re:.*mtp\..*`) provide no packed
+        # weights for the draft, so extend the ignore list to the draft's
+        # layer indices to keep the whole draft unquantized.
+        ct_ignore = getattr(draft_quant_config, "ignore", None)
+        if isinstance(ct_ignore, list) and any(
+            "mtp" in pattern for pattern in ct_ignore
+        ):
+            draft_config = speculative_config.draft_model_config.hf_text_config
+            num_mtp_layers = int(getattr(draft_config, "mtp_num_hidden_layers", 1))
+            extra_ignores = [
+                rf"re:.*\.layers\.{mtp_start_layer_idx + offset}\..*"
+                for offset in range(num_mtp_layers)
+            ]
+            draft_quant_config.ignore = ct_ignore + [
+                pattern for pattern in extra_ignores if pattern not in ct_ignore
+            ]
 
     draft_vllm_config = replace(
         vllm_config,
@@ -297,7 +315,11 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         hidden_size = self.hidden_size
         prev_block_output: torch.Tensor | None = None
 
-        if get_pp_group().is_first_rank:
+        # Native MTP is instantiated with draft PP=1 on the target
+        # model's last PP rank.  get_pp_group() still describes the target
+        # pipeline there, so accept the target hidden states as the draft's
+        # first-stage input instead of waiting for nonexistent draft tensors.
+        if get_pp_group().is_first_rank or hidden_states is not None:
             assert hidden_states is not None
             if inputs_embeds is None:
                 assert input_ids is not None
