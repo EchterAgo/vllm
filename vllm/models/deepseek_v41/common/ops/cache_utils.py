@@ -33,8 +33,9 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
 from vllm.platforms import current_platform
 from vllm.transformers_utils.deepseek_v4_utils import get_compress_ratios
 from vllm.triton_utils import tl, triton
-from vllm.utils.import_utils import has_cutedsl
+from vllm.utils.import_utils import is_cutedsl_supported
 from vllm.utils.math_utils import cdiv, next_power_of_2
+from vllm.v1.attention.ops.fp8_sm80 import _decode_fp8_f32, _encode_fp8_u8
 
 # Per-token byte width of the paged records; ``k_cache.shape[-1]`` -- the
 # width the KV-cache spec publishes -- identifies the record:
@@ -151,12 +152,8 @@ def quantize_and_insert_k_kernel(
             x_scaled = x / scale
             x_clamped = tl.clamp(x_scaled, -fp8_max, fp8_max)
 
-            # Convert to fp8 (FNUZ on gfx942, OCP elsewhere), then bitcast to uint8.
-            if use_fnuz:
-                x_fp8 = x_clamped.to(tl.float8e4b8)
-            else:
-                x_fp8 = x_clamped.to(tl.float8e4nv)
-            x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
+            # Convert to fp8 (FNUZ on gfx942, OCP elsewhere) as raw bytes.
+            x_uint8 = _encode_fp8_u8(x_clamped, use_fnuz)
 
             # Store as uint8 (1 byte each)
             tl.store(token_fp8_ptr + offsets, x_uint8, mask=mask)
@@ -343,7 +340,7 @@ def _dequantize_and_gather_k_kernel(
     block_stride: tl.constexpr,  # total bytes per block (padded) int32
     output_dim: tl.constexpr,  # 512
     fp8_max: tl.constexpr,
-    n_quant_blocks: tl.constexpr,  # 7 real blocks
+    fp8_block: tl.constexpr,  # fp8_dim rounded up to a power of two
     use_fnuz: tl.constexpr = False,
 ):
     batch_idx = tl.program_id(0)
@@ -392,48 +389,40 @@ def _dequantize_and_gather_k_kernel(
         output_row_ptr = out_ptr + batch_idx * out_stride0 + (offset + i) * out_stride1
 
         # ========== Dequantize FP8 portion using UE8M0 ==========
-        for qblock_idx in tl.static_range(n_quant_blocks):
-            qblock_start = qblock_idx * quant_block
+        # The quantization blocks tile fp8_dim exactly, so the whole fp8
+        # range is one contiguous tile: issue it as a single wide load and
+        # gather each element's UE8M0 scale, rather than walking one
+        # dependent 64-wide load per block. This kernel is latency-bound,
+        # so round-trip count is what matters, not bytes.
+        fp8_offsets = tl.arange(0, fp8_block)
+        fp8_mask = fp8_offsets < fp8_dim
 
-            if qblock_start < fp8_dim:
-                offsets = qblock_start + tl.arange(0, quant_block)
-                mask = offsets < fp8_dim
+        x_uint8 = tl.load(token_fp8_ptr + fp8_offsets, mask=fp8_mask, other=0)
+        # Decode fp8 bytes (FNUZ on gfx942, OCP elsewhere) to f32.
+        x_float = _decode_fp8_f32(x_uint8, use_fnuz)
 
-                # Load quantized fp8 values (stored as uint8)
-                x_uint8 = tl.load(token_fp8_ptr + offsets, mask=mask, other=0)
+        # UE8M0: scale = 2^(stored_value - 127), one scale per quant_block.
+        encoded_scale = tl.load(
+            token_scale_ptr + fp8_offsets // quant_block,
+            mask=fp8_mask,
+            other=127,
+        )
+        scale = tl.exp2(encoded_scale.to(tl.float32) - 127.0)
 
-                # Bitcast uint8 back to fp8 (FNUZ on gfx942, OCP elsewhere).
-                if use_fnuz:
-                    x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
-                else:
-                    x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-
-                # Convert fp8 to float32 for computation
-                x_float = x_fp8.to(tl.float32)
-
-                # Load and decode UE8M0 scale
-                # UE8M0: scale = 2^(stored_value - 127)
-                encoded_scale = tl.load(token_scale_ptr + qblock_idx)
-                exponent = encoded_scale.to(tl.float32) - 127.0
-                scale = tl.exp2(exponent)
-
-                # Dequantize: bf16_value = fp8_value * scale
-                x_dequant = x_float * scale
-
-                # Store as bf16
-                tl.store(output_row_ptr + offsets, x_dequant.to(tl.bfloat16), mask=mask)
+        tl.store(
+            output_row_ptr + fp8_offsets,
+            (x_float * scale).to(tl.bfloat16),
+            mask=fp8_mask,
+        )
 
         # ========== Copy BF16 portion directly ==========
-        bf16_output_offset = fp8_dim  # After 448 elements in output
-
-        # Read bf16 from cache
+        # bf16_dim is a power of two, so this needs no mask.
+        bf16_offsets = tl.arange(0, bf16_dim)
         bf16_cache_ptr = token_bf16_ptr.to(tl.pointer_type(tl.bfloat16))
-
-        # Process in chunks of 16
-        for j in tl.static_range(bf16_dim // 16):
-            chunk_offsets = j * 16 + tl.arange(0, 16)
-            bf16_vals = tl.load(bf16_cache_ptr + chunk_offsets)
-            tl.store(output_row_ptr + bf16_output_offset + chunk_offsets, bf16_vals)
+        tl.store(
+            output_row_ptr + fp8_dim + bf16_offsets,
+            tl.load(bf16_cache_ptr + bf16_offsets),
+        )
 
 
 @triton.jit
@@ -680,7 +669,10 @@ def dequantize_and_gather_k_cache_triton(
     max_gather_len: int | None = None,
 ) -> None:
     num_reqs = seq_lens.shape[0]
-    NUM_WORKERS = 128
+    # Workers stride over gather_len and carry no cross-worker state, so surplus
+    # workers simply run zero iterations. gather_len lives on the device, so
+    # sizing the grid from it would cost a host sync; over-provision instead.
+    NUM_WORKERS = 1024
     if k_cache.shape[-1] == V41_NVFP4_BYTES_PER_TOKEN:
         # Keep short gathers unchanged; cap total workers for multi-request chunks.
         num_workers = min(
@@ -756,7 +748,9 @@ def dequantize_and_gather_k_cache_triton(
         block_stride=k_cache.stride(0),
         output_dim=512,
         fp8_max=FP8_MAX,
-        n_quant_blocks=7,
+        # The single wide fp8 tile requires the quant blocks to tile fp8_dim
+        # exactly (448 % 64 == 0), so every scale index is in bounds.
+        fp8_block=triton.next_power_of_2(TOKEN_FP8_DIM),
         use_fnuz=use_fnuz,
     )
 
@@ -788,7 +782,7 @@ def dequantize_and_gather_k_cache(
     ``current_platform.is_fp8_fnuz()`` for ``swa_k_cache`` (C++ encoder
     writes FNUZ on gfx942 and OCP on gfx950).
     """
-    if has_cutedsl() and k_cache.shape[-1] != V41_NVFP4_BYTES_PER_TOKEN:
+    if is_cutedsl_supported() and k_cache.shape[-1] != V41_NVFP4_BYTES_PER_TOKEN:
         # lazily import, otherwise some tests fail due to CUDA driver init failure.
         from vllm.models.deepseek_v4.nvidia.ops.dequant_gather_k_cutedsl import (
             _DEQUANT_GATHER_K_CACHE_CUTEDSL_KERNEL,

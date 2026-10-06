@@ -167,6 +167,9 @@ class IndexerQMxFp4Kernel(VllmCuTeDSLJitKernel["IndexerQMxFp4Kernel.CompileKey"]
         cos_sin_dtype: type[cutlass.Numeric]
         weights_out_dtype: type[cutlass.Numeric]
         coarsen: int
+        # bf16 from the separate GEMMs, fp32 when fuse_input_gemm_weights
+        # merged the indexer weight projection into the fp32-output GEMM.
+        weights_dtype: type[cutlass.Numeric] = BFloat16
 
     @staticmethod
     def kernel(compile_key: CompileKey) -> Any:
@@ -322,12 +325,14 @@ class IndexerQMxFp4Kernel(VllmCuTeDSLJitKernel["IndexerQMxFp4Kernel.CompileKey"]
         self,
         *,
         cos_sin_dtype: type[cutlass.Numeric],
+        weights_dtype: type[cutlass.Numeric] = BFloat16,
         weights_out_dtype: type[cutlass.Numeric],
         **compile_key_fields: int,
     ) -> CompileKey:
         return self.CompileKey(
             **compile_key_fields,
             cos_sin_dtype=cos_sin_dtype,
+            weights_dtype=weights_dtype,
             weights_out_dtype=weights_out_dtype,
         )
 
@@ -373,7 +378,9 @@ class IndexerQMxFp4Kernel(VllmCuTeDSLJitKernel["IndexerQMxFp4Kernel.CompileKey"]
             divisibility=8,
         )
         weights = make_fake_tensor(
-            BFloat16, (num_tokens, compile_key.num_heads), divisibility=8
+            compile_key.weights_dtype,
+            (num_tokens, compile_key.num_heads),
+            divisibility=8,
         )
         q_packed = make_fake_tensor(
             Uint8,
@@ -425,6 +432,7 @@ class IndexerQMxFp4Kernel(VllmCuTeDSLJitKernel["IndexerQMxFp4Kernel.CompileKey"]
             rope_dim=cos_sin_cache.shape[-1],
             num_heads=num_heads,
             cos_sin_dtype=torch_to_cute_dtype(cos_sin_cache.dtype),
+            weights_dtype=torch_to_cute_dtype(weights.dtype),
             weights_out_dtype=torch_to_cute_dtype(weights_out.dtype),
             coarsen=1 if num_tokens < 512 else 4,
         )
@@ -451,6 +459,9 @@ class IndexerQFp8Kernel(VllmCuTeDSLJitKernel["IndexerQFp8Kernel.CompileKey"]):
         num_heads: int
         cos_sin_dtype: type[cutlass.Numeric]
         coarsen: int
+        # bf16 from the separate GEMMs, fp32 when fuse_input_gemm_weights
+        # merged the indexer weight projection into the fp32-output GEMM.
+        weights_dtype: type[cutlass.Numeric] = BFloat16
 
     @staticmethod
     def kernel(compile_key: CompileKey) -> Any:
@@ -608,11 +619,13 @@ class IndexerQFp8Kernel(VllmCuTeDSLJitKernel["IndexerQFp8Kernel.CompileKey"]):
         self,
         *,
         cos_sin_dtype: type[cutlass.Numeric],
+        weights_dtype: type[cutlass.Numeric] = BFloat16,
         **compile_key_fields: int,
     ) -> CompileKey:
         return self.CompileKey(
             **compile_key_fields,
             cos_sin_dtype=cos_sin_dtype,
+            weights_dtype=weights_dtype,
         )
 
     def get_warmup_keys(self, vllm_config: Any) -> list[CompileKey]:
@@ -651,7 +664,9 @@ class IndexerQFp8Kernel(VllmCuTeDSLJitKernel["IndexerQFp8Kernel.CompileKey"]):
             divisibility=8,
         )
         weights = make_fake_tensor(
-            BFloat16, (num_tokens, compile_key.num_heads), divisibility=8
+            compile_key.weights_dtype,
+            (num_tokens, compile_key.num_heads),
+            divisibility=8,
         )
         q_fp8 = make_fake_tensor(
             Uint8,
@@ -690,6 +705,7 @@ class IndexerQFp8Kernel(VllmCuTeDSLJitKernel["IndexerQFp8Kernel.CompileKey"]):
             rope_dim=cos_sin_cache.shape[-1],
             num_heads=num_heads,
             cos_sin_dtype=torch_to_cute_dtype(cos_sin_cache.dtype),
+            weights_dtype=torch_to_cute_dtype(weights.dtype),
             coarsen=1 if num_tokens < 512 else 4,
         )
         launch_args = (

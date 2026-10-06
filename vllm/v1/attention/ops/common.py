@@ -161,6 +161,18 @@ def pack_ue8m0_x4(scale):
     return ((scale.to(tl.int32, bitcast=True) >> 23) & 0xFF) * 0x01010101
 
 
+_FP8_DTYPES = frozenset(
+    dt
+    for dt in (
+        getattr(torch, "float8_e4m3fn", None),
+        getattr(torch, "float8_e4m3fnuz", None),
+        getattr(torch, "float8_e5m2", None),
+        getattr(torch, "float8_e5m2fnuz", None),
+    )
+    if dt is not None
+)
+
+
 def pack_seq_triton(
     x: torch.Tensor,
     lengths: torch.Tensor,
@@ -187,6 +199,15 @@ def pack_seq_triton(
         packed: [B, Lmax, ...] — packed tensor.
 
     """
+    # fp8 tensors are packed as raw bytes: a float8 pointer argument does not
+    # compile in Triton below SM89, and the pad slots are masked downstream
+    # (context_lens), so an exact 0x00 byte pad is equivalent to the fp32 pad.
+    fp8_dtype = x.dtype if x.dtype in _FP8_DTYPES else None
+    if fp8_dtype is not None:
+        return pack_seq_triton(x.view(torch.uint8), lengths, 0, block_t, block_d).view(
+            fp8_dtype
+        )
+
     is_uint8 = x.dtype == torch.uint8
     if is_uint8:
         assert isinstance(pad_value, int) and 0 <= pad_value <= 255, (
