@@ -251,6 +251,24 @@ class InputProcessor:
 
         return watermarking
 
+    def _apply_default_thinking_token_budget(
+        self, sampling_params: SamplingParams
+    ) -> None:
+        """Fill in the server-wide default thinking budget for requests that do
+        not set one, when reasoning is enabled. A request-level value always
+        takes priority."""
+        if sampling_params.thinking_token_budget is not None:
+            return
+        # Trace replay is incompatible with a thinking budget; leave it unset.
+        if sampling_params.trace_decode_token_ids:
+            return
+        reasoning_config = self.vllm_config.reasoning_config
+        if reasoning_config is None or not reasoning_config.enabled:
+            return
+        budget = reasoning_config.default_thinking_token_budget
+        if isinstance(budget, int) and not isinstance(budget, bool):
+            sampling_params.thinking_token_budget = budget
+
     def _normalize_trace_replay_params(
         self, sampling_params: SamplingParams, prompt_len: int
     ) -> None:
@@ -447,6 +465,7 @@ class InputProcessor:
         if isinstance(params, SamplingParams):
             # TODO: can we avoid cloning here in multiproc case?
             sampling_params = params.clone()
+            self._apply_default_thinking_token_budget(sampling_params)
             # Resolve on the request-local copy: `params` may be shared across
             # prompts, requests and even engines by the caller.
             assert watermarking is not None
