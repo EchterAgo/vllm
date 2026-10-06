@@ -155,6 +155,7 @@ def qwen3_config(
     tool_start: str = TOOL_CALL_START,
     tool_end: str = TOOL_CALL_END,
     turn_boundary_tokens: frozenset[str] = frozenset(),
+    strip_leading_content_newlines: bool = True,
 ) -> ParserEngineConfig:
     return ParserEngineConfig(
         name=name,
@@ -285,6 +286,11 @@ def qwen3_config(
         arg_value_extender=_qwen3_arg_value_extender,
         stream_arg_deltas=True,
         strip_trailing_reasoning_whitespace=False,
+        # The Qwen3 chat template renders assistant history as
+        # `` oweto{reasoning}\n\n{content}``; the model emits the ``\n\n``
+        # separator itself right after  oweto, so it must not surface as
+        # the first content delta.
+        strip_leading_content_newlines=strip_leading_content_newlines,
         tool_args_json=False,
     )
 

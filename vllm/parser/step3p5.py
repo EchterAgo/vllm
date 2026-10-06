@@ -34,6 +34,9 @@ def step3p5_config() -> ParserEngineConfig:
             turn_boundary_tokens=CHATML_TURN_BOUNDARIES,
         ),
         strip_trailing_reasoning_whitespace=True,
+        # Step3.5 keeps the newline after </think> in its content; the
+        # qwen3 default (strip_leading_content_newlines=True) must not leak here.
+        strip_leading_content_newlines=False,
     )
 
 

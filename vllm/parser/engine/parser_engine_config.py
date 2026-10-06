@@ -37,6 +37,9 @@ class ParserState(Enum):
     TOOL_NAME = auto()
     TOOL_ARGS = auto()
     TOOL_BETWEEN = auto()
+    # Inside a block belonging to a different model format; terminals
+    # matched here pass through as plain content.
+    FOREIGN_BLOCK = auto()
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +47,11 @@ class Transition:
     next_state: ParserState
     events: tuple[EventType, ...] = field(default_factory=tuple)
     skip_in_token_id_mode: bool = False
+    # Hold this transition's events until the tool name completes, then
+    # validate the name before committing to the tool call.  Set on
+    # recovery transitions whose trigger marker has no dedicated special
+    # token, so prose quoting the marker is not misparsed as a tool call.
+    validate_tool_name: bool = False
 
 
 @dataclass(frozen=True)
@@ -116,6 +124,13 @@ class ParserEngineConfig:
 
     # Prevents trailing-whitespace accumulation across multi-turn conversations.
     strip_trailing_reasoning_whitespace: bool = True
+
+    # Drop leading newlines from content when it directly follows a reasoning
+    # section. Chat templates render assistant history as
+    # `` oweto{reasoning}\n\n{content}``, so models trained on that format
+    # emit the separator themselves right after  oweto; without this, the
+    # first content delta of every reply begins with ``"\n\n"``.
+    strip_leading_content_newlines: bool = False
 
     # Drop content that is entirely whitespace when tool calls follow.
     drop_whitespace_only_content_before_tools: bool = True
