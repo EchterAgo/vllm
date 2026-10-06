@@ -473,5 +473,5 @@ def _warmup_kernels(
     worker_execute_model(cleanup_output)
     model_runner.kv_connector.set_disabled(False)
     if model_runner.kv_block_zeroer is not None:
-        model_runner.kv_block_zeroer.zero_block_ids([0])
+        model_runner.kv_block_zeroer.zero_null_block()
     torch.accelerator.synchronize()
