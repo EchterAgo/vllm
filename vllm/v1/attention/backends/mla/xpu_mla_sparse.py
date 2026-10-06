@@ -274,7 +274,12 @@ class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata], SharedTopkIndices
             topk_indices,
             BLOCK_SIZE=attn_metadata.block_size,
             BLOCK_STRIDE_ROWS=block_stride_rows,
-            NUM_TOPK_TOKENS=attn_metadata.topk_tokens,
+            # The buffer's own width, not the logical top-k. GLM-5.3-Flash's
+            # kpool indexer reserves `kpool - 1` extra slots for the in-progress
+            # pool tail and rounds the total up to the sparse-MLA 128-column
+            # tile (2048 -> 2176); the padding stays -1 and is masked. Models
+            # whose buffer is exactly topk_tokens wide are unaffected.
+            NUM_TOPK_TOKENS=topk_indices.shape[1],
         )
 
         attn_out = self._forward_bf16_kv(q, kv_rows, topk_indices_global, attn_metadata)

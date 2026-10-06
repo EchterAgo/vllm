@@ -544,6 +544,20 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
     """
     backend = vllm_config.attention_config.backend
     device_capability = current_platform.get_device_capability()
+    if device_capability is not None and device_capability.major == 8:
+        if backend is not None and (
+            backend != AttentionBackendEnum.TRITON_MLA_SPARSE_DSV4
+        ):
+            raise ValueError(
+                f"{backend.name} is not supported for DeepSeek V4 on SM8x; "
+                "use TRITON_MLA_SPARSE_DSV4 (default)."
+            )
+        # indexer_kv_dtype="mxfp4" is rejected by dsa_indexer_uses_fp4().
+        from vllm.models.deepseek_v4.ampere.ampere_sparse import (
+            DeepseekV4AmpereMLAAttention,
+        )
+
+        return DeepseekV4AmpereMLAAttention
     if backend in (
         AttentionBackendEnum.FLASHINFER_MLA_SPARSE,
         AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM120,
@@ -1407,6 +1421,9 @@ class DeepseekV4ForCausalLM(
 
     def process_weights_after_loading(self) -> None:
         self.model.finalize_mhc_broadcast_weights()
+        for module in self.modules():
+            if isinstance(module, DeepseekV4Attention):
+                module.fuse_input_gemm_weights()
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
