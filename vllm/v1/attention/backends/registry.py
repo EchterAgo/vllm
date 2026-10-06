@@ -110,6 +110,9 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
     ROCM_FLASHMLA_SPARSE_DSV4 = (
         "vllm.models.deepseek_v4.amd.rocm.DeepseekV4ROCMAiterMLASparseBackend"
     )
+    TRITON_MLA_SPARSE_DSV4 = (
+        "vllm.models.deepseek_v4.ampere.ampere_sparse.DeepseekV4AmpereMLASparseBackend"
+    )
     # DeepSeek V4.1 sparse MLA backends (model-driven; selected via the V4.1
     # layer). Separate names from DSV4 so a V4.1 model never resolves the
     # V4.0 backend classes through this enum.
