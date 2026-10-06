@@ -1242,6 +1242,47 @@ def test_adaptive_draft_lengths_match_and_bonus_oracle(
         )
 
 
+@pytest.mark.parametrize("num_speculative_steps", [1, 3])
+def test_degenerate_target_logits_never_emit_out_of_vocab(
+    num_speculative_steps: int,
+):
+    """
+    Guard against vllm-project/vllm#50843: the tile-local argmax pads
+    out-of-vocab lanes with -inf, and an all-NaN target row makes every
+    in-vocab lane lose the NaN-blind Triton max, so the local argmax lands
+    on the first padding lane and greedy rejection sampling emits
+    token_id == vocab_size. Nothing downstream bounds a sampled id, and
+    DeepSeek-V4 hash-MoE routing gathers by it directly.
+    """
+    torch.manual_seed(7)
+    device = "cuda"
+    num_trials = 8
+
+    nan_target = torch.full(
+        (VOCAB_SIZE,), float("nan"), device=device, dtype=torch.float32
+    )
+    draft_logits_1d = torch.randn(VOCAB_SIZE, device=device, dtype=torch.float32)
+
+    inputs = _build_rejection_sample_inputs(
+        nan_target,
+        draft_logits_1d,
+        num_speculative_steps,
+        temperature=0.0,
+        num_trials=num_trials,
+    )
+
+    sampled, num_sampled = rejection_sample(
+        **inputs, num_speculative_steps=num_speculative_steps
+    )
+
+    steps = torch.arange(num_speculative_steps + 1, device=device).unsqueeze(0)
+    accepted_mask = steps < num_sampled.unsqueeze(1)
+    emitted = sampled[accepted_mask]
+    assert ((emitted >= 0) & (emitted < VOCAB_SIZE)).all(), (
+        f"out-of-vocab token ids emitted: {emitted[emitted >= VOCAB_SIZE].tolist()}"
+    )
+
+
 def _residual_recovery_logits(
     inputs: dict,
     num_sampled: torch.Tensor,
