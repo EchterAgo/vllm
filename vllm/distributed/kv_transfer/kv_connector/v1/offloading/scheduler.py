@@ -383,6 +383,9 @@ class RequestOffloadState:
     load_key_ranges: list[tuple[int, int, OffloadKey]] = field(default_factory=list)
     # True once on_request_finished has been signaled to the manager.
     finished_signaled: bool = False
+    # Hit blocks pinned in the primary tier between lookup and prepare_load
+    # (see OffloadingManager.reserve_hits); released exactly once.
+    reserved_keys: list[OffloadKey] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.group_states = tuple(
@@ -819,6 +822,13 @@ class OffloadingConnectorScheduler:
                 )
         return None if defer_lookup or pending_in_window else consecutive_hits
 
+    def _release_reservation(self, req_status: RequestOffloadState) -> None:
+        if req_status.reserved_keys:
+            self.manager.release_reservation(
+                req_status.reserved_keys, req_status.req_context
+            )
+            req_status.reserved_keys = []
+
     def _lookup_complete_chunks(
         self,
         req_status: RequestOffloadState,
@@ -1169,6 +1179,19 @@ class OffloadingConnectorScheduler:
                 self._maybe_observe_lookup_async_delay(req_status)
         req_status.update_num_hit_chunks(num_computed_tokens + (num_hit_tokens or 0))
 
+        # Re-reserve for this pass: pin every hit block so a concurrent
+        # store's eviction cannot invalidate the hit count we are about to
+        # promise to the vLLM scheduler (prepare_load would assert-crash).
+        self._release_reservation(req_status)
+        if num_hit_tokens:
+            reserve: list[OffloadKey] = []
+            for group_state in req_status.group_states:
+                reserve.extend(group_state.offload_keys[: group_state.num_hit_chunks])
+            if reserve:
+                req_status.reserved_keys = self.manager.reserve_hits(
+                    reserve, req_status.req_context
+                )
+
         return num_hit_tokens, bool(num_hit_tokens)
 
     def get_external_cache_hit_sources(
@@ -1230,6 +1253,9 @@ class OffloadingConnectorScheduler:
             )
 
         if num_external_tokens == 0:
+            req_status = self._req_status.get(request.request_id)
+            if req_status is not None:
+                self._release_reservation(req_status)
             return
 
         # prepare_load() below pins keys that get_num_new_matched_tokens()
@@ -1337,6 +1363,8 @@ class OffloadingConnectorScheduler:
                 group_state.next_stored_chunk_idx = num_chunks
 
         src_spec = self.manager.prepare_load(keys_to_load, req_status.req_context)
+        # prepare_load holds its own pins now; drop the lookup-time reservation.
+        self._release_reservation(req_status)
         dst_spec = GPULoadStoreSpec(
             dst_block_ids, group_sizes=group_sizes, block_indices=block_indices
         )
@@ -1987,6 +2015,7 @@ class OffloadingConnectorScheduler:
             req_status.finished_signaled = True
             self.manager.on_request_finished(req_status.req_context)
             if not req_status.transfer_jobs:
+                self._release_reservation(self._req_status[req_id])
                 del self._req_status[req_id]
         self._current_batch_load_jobs = {}
         self._current_batch_jobs_to_flush = set()
@@ -2098,6 +2127,7 @@ class OffloadingConnectorScheduler:
             del self._jobs[job_id]
             req_status.transfer_jobs.remove(job_id)
             if req_status.finished_signaled and not req_status.transfer_jobs:
+                self._release_reservation(self._req_status[job_status.req_id])
                 del self._req_status[job_status.req_id]
 
     def get_stats(self) -> OffloadingConnectorStats | None:
@@ -2210,6 +2240,7 @@ class OffloadingConnectorScheduler:
             if status.req.is_finished():
                 if not status.finished_signaled:
                     self.manager.on_request_finished(status.req_context)
+                self._release_reservation(self._req_status[req_id])
                 del self._req_status[req_id]
 
         # Reset offloading manager cache
