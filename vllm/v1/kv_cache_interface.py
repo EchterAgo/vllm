@@ -1480,6 +1480,14 @@ class KVCacheConfig:
     """Tokens per prefix-cache block hash, resolved by the engine core."""
     cache_hit_alignment_tokens: int | None = None
     """Token granularity of prefix-cache hits, resolved by the engine core."""
+    max_worker_kv_bytes_per_block: int = 0
+    """Maximum per-worker KV bytes per block across ALL workers, filled in by
+    the engine after per-worker configs are computed. With pipeline
+    parallelism the stages hold different layer sets, so their local values
+    differ; shared-memory KV offload layouts must size worker slots by this
+    global maximum to keep every process on one region geometry. 0 means
+    "unknown" and consumers fall back to their local value."""
+
     hisparse_host_num_blocks: int | None = None
     """Capacity of the dedicated HiSparse host-block manager, when enabled."""
 
