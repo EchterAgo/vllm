@@ -60,7 +60,7 @@ def _maybe_dequant(tile):
 
 @lru_cache(maxsize=1)
 def _is_sm80() -> bool:
-    """True on sm_80 (A100/A30): selects the wide FP8 byte-decode tiles."""
+    """True on sm_80 (A100/A800): selects the sm_80 tuning table."""
     return current_platform.get_device_capability() == (8, 0)
 
 
@@ -68,6 +68,19 @@ def _is_sm80() -> bool:
 def _is_sm90() -> bool:
     """True on sm_90 (H100/H200/H20): selects the sm_90 tuning table."""
     return current_platform.get_device_capability() == (9, 0)
+
+
+def _qsa_main_stages(swa_fp8: bool, num_splits: int) -> int:
+    """Software-pipeline depth for the split-K main kernel.
+
+    The software-dequant fp8 path (pre-sm_89) uses half the shared memory per
+    tile, so when the batch is split (num_splits > 1) each program's tile loop
+    is short and dropping to 1 stage doubles resident CTAs and wins ~20% on
+    sm_80; at num_splits == 1 a single program loops every tile and prefetch
+    depth dominates, so 2 stages stays. bf16 and the native-fp8 paths (where
+    the tuning tables were measured) always use 2 stages.
+    """
+    return 1 if swa_fp8 and num_splits > 1 else 2
 
 
 @triton.jit(do_not_specialize=["num_rows", "num_requests"])
@@ -582,6 +595,40 @@ def _select_sm90_config(
     return 32, 4, 1
 
 
+def _select_sm80_config(
+    base_programs: int, use_prefill_config: bool, is_fp8: bool
+) -> tuple[int, int, int]:
+    """(block_n, target_splits, num_warps) tuned on sm_80 (A100-class, CMP 170HX).
+
+    Measured with the QSA production shape (topk=2048, head_dim=256, page 1600)
+    on idle A100-class GPUs. The software e4m3 dequant roughly triples the
+    register footprint of the fp8 path, which spills ~1.7 KB/thread at
+    num_warps<4, so every fp8 entry uses num_warps >= 4.
+    """
+    if is_fp8:
+        if base_programs > 2048:
+            return (32, 1, 4) if use_prefill_config else (64, 1, 8)
+        if base_programs <= 8:
+            return 32, 64, 4
+        if base_programs <= 24:
+            return 64, 8, 8
+        # (64, 64, 8) is within noise of every winner from bp=32 to bp=512.
+        if base_programs <= 512:
+            return 64, 64, 8
+        return 64, 1, 8
+    if base_programs > 2048:
+        return (32, 4, 1) if use_prefill_config else (64, 1, 2)
+    if base_programs <= 32:
+        return 128, 1, 4
+    if base_programs <= 64:
+        return 128, 1, 4
+    if base_programs <= 256:
+        return 32, 2, 1
+    if base_programs <= 512:
+        return 32, 1, 1
+    return 32, 2, 1
+
+
 def _select_config(
     num_rows: int,
     num_kv_heads: int,
@@ -595,7 +642,8 @@ def _select_config(
     on use_prefill_config (capture-stable: at FULL-graph capture max_query_len is
     the uniform decode/verify length). This default table was tuned on GB300;
     sm_120 (RTX PRO 6000 Blackwell) dispatches to _select_sm120_config instead,
-    and sm_90 (Hopper) to _select_sm90_config.
+    sm_90 (Hopper) to _select_sm90_config, and sm_80 (Ampere) to
+    _select_sm80_config.
     """
     base_programs = num_rows * num_kv_heads
     if _is_sm120():
@@ -604,6 +652,10 @@ def _select_config(
         )
     elif _is_sm90():
         BLOCK_N, target_splits, num_warps = _select_sm90_config(
+            base_programs, use_prefill_config, is_fp8
+        )
+    elif _is_sm80():
+        BLOCK_N, target_splits, num_warps = _select_sm80_config(
             base_programs, use_prefill_config, is_fp8
         )
     elif base_programs > 2048:
@@ -624,10 +676,6 @@ def _select_config(
         BLOCK_N, target_splits, num_warps = 64, 4, 2
     else:
         BLOCK_N, target_splits, num_warps = 64, 1, 2
-    if is_fp8 and _is_sm80():
-        # Wider tiles measured faster for the byte-decode path on A100;
-        # unmeasured on sm_86, which keeps the table's tiles.
-        BLOCK_N, num_warps = 128, 4
     num_tiles = triton.cdiv(num_columns, BLOCK_N)
     # Never more splits than tiles, never empty.
     num_splits = min(target_splits, num_tiles)
@@ -682,6 +730,10 @@ def qsa_sparse_paged_attention(
     assert q.dtype == torch.bfloat16
     assert k_cache.dtype == v_cache.dtype
     is_fp8 = k_cache.dtype != torch.bfloat16
+    # Pre-sm_89 Triton rejects fp8e4nv pointers, so the caller hands the
+    # caches as uint8 byte views and the kernel dequantizes in software; that
+    # path uses half the shared memory per tile (see _qsa_main_stages).
+    swa_fp8 = is_fp8 and k_cache.dtype == torch.uint8
     if is_fp8:
         assert k_scale is not None and v_scale is not None
         # Host pre-multiply: fold the K dequant scale into the attention scale
@@ -731,9 +783,14 @@ def qsa_sparse_paged_attention(
         partial_lse = out
     else:
         # FP32 partials preserve accuracy when merging independently normalized
-        # splits.
+        # splits. The fp8 path is the exception: its KV reads are half the
+        # bytes, so fp32 partials are a larger share of traffic, and the
+        # partials are softmax-weighted means of V (bounded by max|V| *
+        # v_scale) that bf16 represents at output precision. Measured +14.7%
+        # at rows=512 on sm_80; the LSE stays fp32 for the merge weights.
+        partial_dtype = torch.float32 if not is_fp8 else torch.bfloat16
         partial_output = torch.empty(
-            (num_splits, *q.shape), dtype=torch.float32, device=q.device
+            (num_splits, *q.shape), dtype=partial_dtype, device=q.device
         )
         partial_lse = torch.empty(
             (num_splits, q.shape[0], q.shape[1]),
@@ -783,7 +840,7 @@ def qsa_sparse_paged_attention(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         num_warps=partial_warps,
-        num_stages=2,
+        num_stages=_qsa_main_stages(swa_fp8, num_splits),
     )
     if num_splits == 1:
         return out
@@ -827,6 +884,7 @@ def warmup_qsa_sparse_paged_attention(
         else torch.uint8
     )
     cache_dtype = fp8_dtype if is_fp8 else key_cache.dtype
+    swa_fp8 = is_fp8 and cache_dtype == torch.uint8
     num_kv_heads = key_cache.shape[2]
     group_size = num_query_heads // num_kv_heads
     block_m = triton.next_power_of_2(group_size)
@@ -884,7 +942,7 @@ def warmup_qsa_sparse_paged_attention(
             partial_lse_ptr = output_ptr
         else:
             partial_output_ptr = TritonWarmupTensor(
-                torch.float32,
+                torch.bfloat16 if is_fp8 else torch.float32,
                 shape=(num_splits, num_rows, num_query_heads, head_dim),
             )
             partial_lse_ptr = TritonWarmupTensor(
@@ -931,7 +989,7 @@ def warmup_qsa_sparse_paged_attention(
             BLOCK_M=block_m,
             BLOCK_N=block_n,
             num_warps=warps,
-            num_stages=2,
+            num_stages=_qsa_main_stages(swa_fp8, num_splits),
             grid=(num_rows, num_kv_heads, num_splits),
         )
         if num_splits > 1:
