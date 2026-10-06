@@ -38,6 +38,11 @@ def granite_thinking_config(thinking: bool = True) -> ParserEngineConfig:
     return dataclasses.replace(
         nemotron_v3_config(thinking=thinking),
         name="granite_thinking_parser",
+        # GraniteThinkingParser strips the template's leading content newlines
+        # itself (delayed reasoning_ended transition); the engine-level strip
+        # inherited from the qwen3 default would consume them first and leave
+        # the transition unfired.
+        strip_leading_content_newlines=False,
     )
 
 
