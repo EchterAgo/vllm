@@ -106,6 +106,9 @@ class RequestState:
     pending_cascade_keys: list[OffloadKey] = field(default_factory=list)
 
 
+_SYNC_PROMOTION_TIMEOUT_S = 30.0
+
+
 class JobMetadata(NamedTuple):
     transfer_job: TransferJob
     tier_idx: int
@@ -775,7 +778,110 @@ class TieringOffloadingManager(OffloadingManager):
             LoadStoreSpec for reading from primary tier.
 
         """
-        return self.primary_tier.prepare_load(keys, req_context)
+        self._promote_missing_sync(keys, req_context)
+        try:
+            return self.primary_tier.prepare_load(keys, req_context)
+        except AssertionError:
+            self._log_missing_keys(keys, req_context)
+            raise
+
+    def _promote_missing_sync(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> None:
+        """Promote keys that are about to be loaded but only live in a secondary tier.
+
+        The offloading scheduler looks up (and thereby promotes) the keys that
+        decide the hit size -- the full-attention prefix and the sliding-window
+        suffix -- but update_state_after_alloc() then loads every chunk of every
+        KV group in the hit range. With a single CPU tier the extra chunks are
+        always present (groups are stored together); with a secondary tier they
+        may only exist there, and prepare_load() would assert. Promote them
+        here and wait for the transfer (a few MB from the fs tier).
+        """
+        missing = [key for key in keys if self.primary_tier._policy.get(key) is None]
+        if not missing:
+            return
+        for key in missing:
+            promoted = False
+            for tier_idx, tier in enumerate(self.secondary_tiers):
+                if not req_context.load_tier_filter.allows(tier.medium, tier.locality):
+                    continue
+                if tier.lookup(key, req_context) is LookupResult.HIT:
+                    promoted = self._initiate_promotion(tier_idx, key, req_context)
+                    break
+            if not promoted:
+                return  # let prepare_load raise with diagnostics
+        self._flush_pending_promotions()
+        deadline = time.monotonic() + _SYNC_PROMOTION_TIMEOUT_S
+        waited = time.monotonic()
+        while True:
+            self._process_finished_jobs()
+            if all(
+                self.primary_tier.lookup(key, req_context) is LookupResult.HIT
+                for key in missing
+            ):
+                break
+            if time.monotonic() > deadline:
+                logger.error(
+                    "Synchronous promotion of %d keys timed out after %.0fs",
+                    len(missing),
+                    _SYNC_PROMOTION_TIMEOUT_S,
+                )
+                return
+            time.sleep(0.0005)
+        logger.warning(
+            "prepare_load: promoted %d keys synchronously from a secondary tier "
+            "in %.1f ms (req %s)",
+            len(missing),
+            (time.monotonic() - waited) * 1e3,
+            req_context.req_id,
+        )
+
+    def _log_missing_keys(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> None:
+        """Diagnostics for the prepare_load assertion: where is each key?"""
+        for key in keys:
+            chunk = self.primary_tier._policy.get(key)
+            if chunk is not None and chunk.is_ready:
+                continue
+            secondary = {
+                tier.tier_type: str(tier.lookup(key, req_context))
+                for tier in self.secondary_tiers
+            }
+            pending = [
+                tier_idx
+                for tier_idx, by_ctx in self._pending_load_submissions.items()
+                for entry in by_ctx.values()
+                if key in entry.keys
+            ]
+            in_flight = [
+                (job_id, job.tier_idx, job.transfer_job.is_promotion)
+                for job_id, job in self._jobs.items()
+                if key in job.transfer_job.keys
+            ]
+            logger.error(
+                "prepare_load key %s: primary=%s secondary=%s pending_promotions=%s "
+                "in_flight_jobs=%s req=%s",
+                key.hex() if isinstance(key, bytes) else key,
+                "missing" if chunk is None else "not-ready",
+                secondary,
+                pending,
+                in_flight,
+                req_context,
+            )
+
+    @override
+    def reserve_hits(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> list[OffloadKey]:
+        return self.primary_tier.reserve_hits(keys, req_context)
+
+    @override
+    def release_reservation(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> None:
+        self.primary_tier.release_reservation(keys, req_context)
 
     @override
     def touch(self, keys: Collection[OffloadKey], req_context: ReqContext):
