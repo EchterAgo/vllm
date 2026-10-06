@@ -299,6 +299,23 @@ class OffloadingManager(ABC):
         """
         return nullcontext()
 
+    def reserve_hits(
+        self, keys: "Collection[OffloadKey]", req_context: "ReqContext"
+    ) -> "list[OffloadKey]":
+        """Pin blocks that were just reported as lookup hits so they cannot be
+        evicted before prepare_load() runs. The scheduler promises to call
+        release_reservation() with the returned keys exactly once. Managers
+        without eviction may keep the default no-op.
+
+        Returns the subset of keys actually pinned."""
+        return []
+
+    def release_reservation(
+        self, keys: "Collection[OffloadKey]", req_context: "ReqContext"
+    ) -> None:
+        """Release pins taken by reserve_hits()."""
+        return
+
     @abstractmethod
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
         """Checks whether a single block is offloaded and ready to be read.

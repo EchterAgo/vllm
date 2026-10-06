@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
+import os
 import time
 from collections import deque
-from collections.abc import Iterator, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import NamedTuple
 
@@ -26,7 +27,6 @@ from vllm.v1.kv_offload.base import (
     OffloadingWorker,
     TransferResult,
 )
-from vllm.v1.kv_offload.cpu.host_register import host_register, host_unregister
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.kv_offload.cpu.swap_blocks_triton import (
     THRESHOLD_BYTES,
@@ -194,78 +194,147 @@ def _canonical_block_sizes(
     return canonical_bytes_per_block
 
 
-# Bound registration size to avoid driver limits on large host allocations.
-MAX_HOST_REGISTER_CHUNK_BYTES = 64 * 1024**3
-# Amortize per-call overhead with the bytes not registered in each row.
-MIN_HOST_REGISTER_SAVED_BYTES = 3 * 1024**2
+_PIN_SPAN_BYTES = 1 << 30
 
 
-def pin_mmap_region(
-    region: SharedOffloadRegion, worker_slot_only: bool = False
-) -> None:
-    """Register row-aligned chunks or this worker's slots, rolling back on failure."""
-    rank = region.rank
-    base_ptr = region._base.data_ptr()
-    total_size = region.total_size_bytes
-    # Chunks end on block-row boundaries, which are page aligned, so neither the
-    # driver's page rounding nor any single block transfer straddles two
-    # registrations.
-    rows_per_chunk = max(MAX_HOST_REGISTER_CHUNK_BYTES // region._row_stride, 1)
-    chunk_size = rows_per_chunk * region._row_stride
-    ranges: Iterator[tuple[int, int]] = (
-        (offset, min(chunk_size, total_size - offset))
-        for offset in range(0, total_size, chunk_size)
-    )
-    stride, slot, page = region._row_stride, region.cpu_page_size, region.page_size
-    min_savings = max(page, MIN_HOST_REGISTER_SAVED_BYTES)
-    if worker_slot_only and region.rank is not None and stride - slot >= min_savings:
-        # Round each slot out to pages; the worker's next slot is a page away.
-        ranges = region.iter_worker_slot_ranges()
-    else:
-        reason = (
-            "whole-region layout requested"
-            if not worker_slot_only
-            else "no worker rank"
-            if region.rank is None
-            else f"less than {min_savings} bytes saved per row"
-        )
+def pin_mmap_region(region: SharedOffloadRegion) -> None:
+    """Pin this rank's slots of the shared region via cudaHostRegister.
+
+    Only the slots owned by this rank are registered (disjoint across ranks,
+    since the driver lets one process pin a given physical page); contiguous
+    layouts register in large spans to stay under the driver's registration
+    count cap. Retries transient failures and fails fast on a hard one, then
+    consumes any stale CUDA last-error before returning.
+    """
+    if not current_platform.is_cuda_alike():
         logger.info(
-            "Registering full CPU offload region rank=%s (row=%d, slot=%d bytes): %s",
-            rank,
-            stride,
-            slot,
-            reason,
+            "Skipping mmap host registration on %s; cudaHostRegister is only "
+            "available on CUDA/ROCm.",
+            current_platform.device_name,
         )
-
-    # Register, drain and roll back through the same helper, so a failed
-    # chunk leaves neither a pending error nor a partly pinned region.
-    addresses: list[int] = []
-    registered_bytes = 0
-    for offset, size in ranges:
-        address = base_ptr + offset
-        if host_register(address, size):
-            addresses.append(address)
-            registered_bytes += size
-            continue
-        logger.warning(
-            "host_register failed for rank=%d at %.2f of %.2f GB; "
-            "the offload region stays pageable",
-            rank,
-            offset / 1e9,
-            total_size / 1e9,
-        )
-        for registered in reversed(addresses):
-            host_unregister(registered)
         return
 
-    region.pinned_addresses.extend(addresses)
+    rank = region.rank
+    if rank is None:
+        return
+
+    if os.environ.get("VLLM_KV_OFFLOAD_SKIP_PIN") == "1":
+        logger.warning(
+            "VLLM_KV_OFFLOAD_SKIP_PIN=1: leaving the offload region unpinned "
+            "(diagnostic knob; transfers will fail or crawl)"
+        )
+        return
+
+    # The region is shared by every worker process, and the CUDA driver only
+    # lets the FIRST process cudaHostRegister a given physical page - later
+    # registrations from sibling ranks fail with cudaErrorInvalidValue and the
+    # unpinned fallback then crashes the UVA transfer kernels at warmup.
+    # Register only the slots owned by this rank (disjoint across ranks).
+    base_ptr = region._base.data_ptr()
+    slot_size = region._worker_area_end - region._worker_offset
+    # The driver caps the *number* of host registrations (about 2^18 across
+    # the GPUs of a node), not the bytes: one ~1 MB registration per chunk
+    # tops out at ~250 GB. When this worker owns whole rows (a single worker
+    # per row, e.g. DP/TP=1) its slots are contiguous, so register them in
+    # large chunks instead. Interleaved layouts (TP>1) keep one registration
+    # per slot because a page may only be registered by one process.
+    # (row_stride is page-padded, so test "only one slot fits in a row".)
+    contiguous = region._worker_offset == 0 and region._row_stride < 2 * slot_size
+    span_chunks = max(1, _PIN_SPAN_BYTES // slot_size) if contiguous else 1
+    cudart = torch.cuda.cudart()
+    registered: list[int] = []
+    had_failed_attempt = False
+    _t0 = time.perf_counter()
+    for chunk in range(0, region.num_chunks, span_chunks):
+        n_chunks = min(span_chunks, region.num_chunks - chunk)
+        off = chunk * region._row_stride + region._worker_offset
+        reg_size = slot_size if n_chunks == 1 else n_chunks * region._row_stride
+        # Transient failures happen under memory pressure (concurrent ranks
+        # pinning + model weights loading); retry before giving up.
+        for attempt in range(4):
+            result = cudart.cudaHostRegister(base_ptr + off, reg_size, 0)
+            if result.value == 0:
+                break
+            # NOTE: a failed runtime call also records itself in this
+            # thread's CUDA *last-error* slot. torch only reads that slot in
+            # its kernel-LAUNCH checks, so if it is not consumed the stale
+            # error resurfaces minutes later as a bogus AcceleratorError on
+            # the first launch-checked op (historically: the zero_() fill in
+            # warmup or add_request) and kills the boot. The fence after this
+            # loop consumes it; log the real failure here, at its origin.
+            had_failed_attempt = True
+            logger.warning(
+                "cudaHostRegister rank=%d chunk=%d attempt=%d failed with "
+                "code=%d; retrying",
+                rank,
+                chunk,
+                attempt,
+                result.value,
+            )
+            # Consume the stale last-error IMMEDIATELY, not just in the
+            # post-loop fence: on this code base NCCL collectives can run
+            # interleaved with registration, and NCCL's internal error
+            # checks inherit the stale code as "unhandled cuda error",
+            # killing the boot before the fence ever runs.
+            try:
+                _probe = torch.zeros(1, device="cuda")
+                _probe += 1
+                torch.cuda.synchronize()
+            except Exception:
+                pass
+            time.sleep(0.5 * (attempt + 1))
+        if result.value != 0:
+            for done in registered:
+                cudart.cudaHostUnregister(base_ptr + done)
+            # Unpinned is not a usable fallback: the UVA transfer kernels
+            # dereference these host pointers and crash later with an async
+            # cudaErrorInvalidValue far from this code. Fail fast instead.
+            raise RuntimeError(
+                f"cudaHostRegister failed for rank={rank} at chunk {chunk}/"
+                f"{region.num_chunks} (code={result.value}) after retries. "
+                "This usually means host memory pressure or insufficient "
+                "free /dev/shm. Check for stale vllm_offload_*.mmap files "
+                "and overall RAM usage."
+            )
+        registered.append(off)
+    region._pinned_slot_offsets = registered
     region.is_pinned = True
-    logger.debug(
-        "Host-registered mmap region rank=%d %.2f GB in %d chunk(s)",
+    logger.info(
+        "cudaHostRegister rank=%d pinned %d chunks in %d registrations "
+        "(%.2f GB) in %.1fs",
         rank,
-        registered_bytes / 1e9,
-        len(addresses),
+        region.num_chunks,
+        len(registered),
+        region.num_chunks * slot_size / 1e9,
+        time.perf_counter() - _t0,
     )
+
+    # Launch-check fence: force a kernel-launch error check NOW so that any
+    # stale last-error recorded during the registration phase (e.g. by a
+    # cudaHostRegister attempt that we retried successfully) is attributed
+    # and consumed here instead of poisoning the first launch-checked op of
+    # warmup minutes later (the boot-time "async cudaErrorInvalidValue"
+    # crash: torch.AcceleratorError at zero_()/torch.zeros with no real
+    # device fault behind it).
+    try:
+        probe = torch.zeros(8, device="cuda")
+        probe += 1
+        torch.cuda.synchronize()
+    except Exception as exc:
+        logger.warning(
+            "Consumed a stale CUDA error left over from the host "
+            "registration phase (had_failed_attempt=%s): %s -- verifying "
+            "the device is actually healthy.",
+            had_failed_attempt,
+            exc,
+        )
+        # A stale last-error is cleared by the read above; a genuinely
+        # broken context is not. Re-probe: if this also fails, the device
+        # is truly poisoned and the boot must die (fail fast).
+        probe = torch.zeros(8, device="cuda")
+        probe += 1
+        torch.cuda.synchronize()
+        logger.info("Device healthy after clearing stale CUDA error; continuing boot.")
 
 
 def _new_descriptor_buffers(
@@ -814,7 +883,7 @@ class CPUOffloadingWorker(OffloadingWorker):
         pin_memory = PIN_MEMORY
         logger.info("Allocating %d CPU tensors...", len(kv_caches.tensors))
         if mmap_region is not None and pin_memory:
-            pin_mmap_region(mmap_region, worker_slot_only=not canonical_layout)
+            pin_mmap_region(mmap_region)
         host_memory_is_pinned = pin_memory and (
             mmap_region is None or mmap_region.is_pinned
         )
