@@ -446,3 +446,67 @@ def test_encode_messages_unknown_role_raises_value_error(encoding_module):
             [{"role": "SYSTEM", "content": "Hello"}],
             thinking_mode="chat",
         )
+
+
+# --- Default thinking token budget: server-wide default from reasoning config
+
+
+def _budget_processor(budget: int | None, *, enabled: bool = True):
+    from vllm.config.reasoning import ReasoningConfig
+
+    processor = Mock(spec=InputProcessor)
+    reasoning_config = ReasoningConfig(default_thinking_token_budget=budget)
+    reasoning_config._enabled = enabled
+    processor.vllm_config = Mock()
+    processor.vllm_config.reasoning_config = reasoning_config
+    return processor
+
+
+def test_default_thinking_token_budget_applied_when_unset():
+    processor = _budget_processor(7)
+    params = SamplingParams()
+
+    InputProcessor._apply_default_thinking_token_budget(processor, params)
+
+    assert params.thinking_token_budget == 7
+
+
+def test_request_thinking_token_budget_overrides_default():
+    processor = _budget_processor(7)
+    params = SamplingParams(thinking_token_budget=3)
+
+    InputProcessor._apply_default_thinking_token_budget(processor, params)
+
+    assert params.thinking_token_budget == 3
+
+
+def test_default_thinking_token_budget_skipped_when_reasoning_disabled():
+    processor = _budget_processor(7, enabled=False)
+    params = SamplingParams()
+
+    InputProcessor._apply_default_thinking_token_budget(processor, params)
+
+    assert params.thinking_token_budget is None
+
+
+def test_default_thinking_token_budget_skipped_when_unset():
+    processor = _budget_processor(None)
+    params = SamplingParams()
+
+    InputProcessor._apply_default_thinking_token_budget(processor, params)
+
+    assert params.thinking_token_budget is None
+
+
+def test_reasoning_config_rejects_negative_default_budget():
+    from vllm.config.reasoning import ReasoningConfig
+
+    with pytest.raises(ValidationError, match="default_thinking_token_budget"):
+        ReasoningConfig(default_thinking_token_budget=-5)
+
+
+def test_reasoning_config_maps_unlimited_default_budget_to_none():
+    from vllm.config.reasoning import ReasoningConfig
+
+    cfg = ReasoningConfig(default_thinking_token_budget=-1)
+    assert cfg.default_thinking_token_budget is None
