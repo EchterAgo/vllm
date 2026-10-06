@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import functools
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import cast
 
 import torch
@@ -31,12 +31,15 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
 )
 from vllm.v1.attention.backends.mla.sparse_swa import (
+    _LAYER_TYPE_C4A,
+    _LAYER_TYPE_C128A,
+    _LAYER_TYPE_SWAONLY,
     DeepseekSparseSWAMetadata,
     DeepseekSparseSWAMetadataBuilder,
 )
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
-    build_prefill_topk_ragged_indices,
     build_ragged_indices_from_dense,
+    lengths_to_indptr,
     rocm_inv_rope_einsum,
     rocm_inverse_rope_rows_,
     rocm_sparse_attn_decode,
@@ -104,27 +107,8 @@ def _trust_dsv4_extra_cache_nan_free(
     )
 
 
-def _aiter_sparse_mla_enabled(has_kv_transfer: bool) -> bool:
-    from vllm._aiter_ops import rocm_aiter_ops
-
-    if not rocm_aiter_ops.is_triton_sparse_mla_enabled():
-        return False
-    # The aiter kernel does not scrub NaNs, so like the trust check above it
-    # needs a cache only the canonical writer has touched.
-    if has_kv_transfer:
-        logger.warning_once(
-            "VLLM_ROCM_USE_AITER_TRITON_SPARSE_MLA is ignored with a KV "
-            "connector; DeepSeek V4 keeps the Triton sparse attention."
-        )
-        return False
-    return True
-
-
 def _build_indptr_from_lengths(lengths: torch.Tensor) -> torch.Tensor:
-    lengths = lengths.to(dtype=torch.int32).contiguous()
-    indptr = torch.zeros(lengths.shape[0] + 1, dtype=torch.int32, device=lengths.device)
-    torch.cumsum(lengths, dim=0, out=indptr[1:])
-    return indptr
+    return lengths_to_indptr(lengths)
 
 
 def apply_pre_quantized_block_scaled_mm(
@@ -432,32 +416,55 @@ def compute_global_topk_ragged_indices_and_indptr(
     return global_topk_ragged, topk_indptr, topk_lens
 
 
-def _copy_ragged_to_graph_buffers(
-    ragged_indices: torch.Tensor,
-    ragged_indptr: torch.Tensor,
+def _build_ragged_into_graph_buffers(
+    dense_indices: torch.Tensor,
+    lengths: torch.Tensor,
     ragged_indices_buffer: torch.Tensor,
     ragged_indptr_buffer: torch.Tensor,
     num_rows: int,
     max_entries_per_row: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Copy dynamic ragged metadata into persistent CUDA graph buffers.
+    """Build ragged metadata straight into the persistent CUDA graph buffers.
 
-    FULL decode graphs capture kernel argument addresses. Keep the returned
-    tensors backed by stable storage, while indptr continues to bound reads.
+    FULL decode graphs capture kernel argument addresses, so the returned
+    tensors have to be backed by stable storage; indptr continues to bound
+    reads. Building in place gets that for free -- the previous form allocated
+    fresh tensors and copied them over, which cost two device-to-device
+    memcpy nodes per builder per step. The returned indices view keeps the
+    full ``num_rows * max_entries_per_row`` capacity (indptr carries the true
+    NNZ), which is also what the gfx950 sync-free split selector expects.
     """
-    indptr_out = ragged_indptr_buffer[: num_rows + 1]
-    indptr_out.copy_(ragged_indptr, non_blocking=True)
-
     max_entries = max(num_rows * max_entries_per_row, 1)
-    ragged_out = ragged_indices_buffer[:max_entries]
-    source_entries = ragged_indices.numel()
-    if source_entries > 0:
-        ragged_out[:source_entries].copy_(ragged_indices, non_blocking=True)
-    if _ON_GFX950:
-        # Preserve the graph-stable base pointer while exposing source capacity
-        # to the sync-free split selector; indptr still carries the true NNZ.
-        ragged_out = ragged_out[: max(source_entries, 1)]
-    return ragged_out, indptr_out
+    # NOTE: build_ragged_indices_from_dense's third argument is a clamp on
+    # index *values* (the KV row count), not the query-row count; the callers
+    # already bound their indices, so pass -1 (no clamp) like the pre-in-place
+    # implementation did.
+    return build_ragged_indices_from_dense(
+        dense_indices,
+        lengths,
+        -1,
+        indices_out=ragged_indices_buffer[:max_entries],
+        indptr_out=ragged_indptr_buffer[: num_rows + 1],
+    )
+
+
+@dataclass
+class _PrefillChunkSlices:
+    """Prefill metadata slices for one request chunk.
+
+    Every DSv4 layer of a given type re-derives identical slices from the step's
+    metadata, so they are built once per step and cached on the SWA metadata.
+    """
+
+    chunk_size: int
+    query_start: int
+    query_end: int
+    seq_lens: torch.Tensor
+    gather_lens: torch.Tensor
+    swa_block_table: torch.Tensor
+    query_start_loc: torch.Tensor
+    compressed_seq_lens: torch.Tensor | None
+    compressed_block_table: torch.Tensor | None
 
 
 @dataclass
@@ -473,9 +480,11 @@ class DeepseekV4ROCMAiterMLASparseMetadata(DeepseekV4FlashMLAMetadata):
 class DeepseekV4ROCMAiterSparseSWAMetadata(DeepseekSparseSWAMetadata):
     decode_swa_ragged_indices: torch.Tensor | None = None
     decode_swa_ragged_indptr: torch.Tensor | None = None
-    # Built only for the aiter prefill, which reads the SWA cache in place.
-    prefill_swa_ragged_indices: torch.Tensor | None = None
-    prefill_swa_ragged_indptr: torch.Tensor | None = None
+    # Per-step prefill metadata slices, keyed by DSv4 layer type. Fresh instance per
+    # build(), so the cache never outlives the metadata it was derived from.
+    prefill_chunk_slices: dict[str, list[_PrefillChunkSlices]] = field(
+        default_factory=dict
+    )
 
 
 class DeepseekV4ROCMAiterMLASparseMetadataBuilder(DeepseekV4SparseMLAMetadataBuilder):
@@ -527,15 +536,11 @@ class DeepseekV4ROCMAiterMLASparseMetadataBuilder(DeepseekV4SparseMLAMetadataBui
         dense_decode = base.c128a_global_decode_topk_indices
         decode_lens = base.c128a_decode_topk_lens
         if dense_decode is not None and decode_lens is not None:
-            ragged_indices, ragged_indptr = build_ragged_indices_from_dense(
-                dense_decode.reshape(dense_decode.shape[0], -1),
-                decode_lens,
-            )
             assert self.c128a_decode_topk_ragged_indices_buffer is not None
             assert self.c128a_decode_topk_ragged_indptr_buffer is not None
-            ragged_indices, ragged_indptr = _copy_ragged_to_graph_buffers(
-                ragged_indices,
-                ragged_indptr,
+            ragged_indices, ragged_indptr = _build_ragged_into_graph_buffers(
+                dense_decode.reshape(dense_decode.shape[0], -1),
+                decode_lens,
                 self.c128a_decode_topk_ragged_indices_buffer,
                 self.c128a_decode_topk_ragged_indptr_buffer,
                 dense_decode.shape[0],
@@ -595,9 +600,6 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuild
             dtype=torch.int32,
             device=self.device,
         )
-        self._use_aiter_sparse_mla = _aiter_sparse_mla_enabled(
-            self.vllm_config.kv_transfer_config is not None
-        )
 
     def build(
         self,
@@ -613,23 +615,6 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuild
             replay_start=replay_start,
         )
 
-        prefill_ragged_indices = None
-        prefill_ragged_indptr = None
-        if (
-            self._use_aiter_sparse_mla
-            and base.num_prefill_tokens > 0
-            and base.prefill_swa_indices is not None
-            and base.prefill_swa_lens is not None
-        ):
-            # Paged-coordinate rows (image visibility included), so every
-            # layer's prefill shares one build.
-            prefill_ragged_indices, prefill_ragged_indptr = (
-                build_ragged_indices_from_dense(
-                    base.prefill_swa_indices.reshape(base.num_prefill_tokens, -1),
-                    base.prefill_swa_lens,
-                )
-            )
-
         ragged_indices = None
         ragged_indptr = None
         if (
@@ -637,15 +622,11 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuild
             and base.decode_swa_indices is not None
             and base.decode_swa_lens is not None
         ):
-            ragged_indices, ragged_indptr = build_ragged_indices_from_dense(
+            ragged_indices, ragged_indptr = _build_ragged_into_graph_buffers(
                 base.decode_swa_indices.reshape(
                     base.num_decode_tokens, base.decode_swa_width
                 ),
                 base.decode_swa_lens,
-            )
-            ragged_indices, ragged_indptr = _copy_ragged_to_graph_buffers(
-                ragged_indices,
-                ragged_indptr,
                 self.decode_swa_ragged_indices_buffer,
                 self.decode_swa_ragged_indptr_buffer,
                 base.num_decode_tokens,
@@ -656,8 +637,6 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuild
             **vars(base),
             decode_swa_ragged_indices=ragged_indices,
             decode_swa_ragged_indptr=ragged_indptr,
-            prefill_swa_ragged_indices=prefill_ragged_indices,
-            prefill_swa_ragged_indptr=prefill_ragged_indptr,
         )
 
 
@@ -675,7 +654,6 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
     """ROCm sparse MLA attention layer for DeepSeek V4."""
 
     backend_cls = DeepseekV4ROCMAiterMLASparseBackend
-    _use_aiter_sparse_mla = False
 
     def __init__(self, *args, **kwargs):
         vllm_config = args[0] if args else kwargs["vllm_config"]
@@ -701,7 +679,6 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
         else:
             # Disable indexer inner overlap.
             self.indexer.aux_stream = None
-        self._use_aiter_sparse_mla = _aiter_sparse_mla_enabled(self._has_kv_transfer)
 
     def _run_sequential_pipeline(
         self,
@@ -1255,20 +1232,18 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
         if attn_metadata is None:
             # Warmup dummy run: no real metadata. Reserve the same bf16
             # gather workspace _forward_prefill would; the dequantize / topk
-            # / sparse_fwd kernels are skipped this step. The aiter prefill
-            # reads the caches in place and never asks for it.
-            if not self._use_aiter_sparse_mla:
-                swa_only = self.compress_ratio <= 1
-                N = (
-                    0
-                    if swa_only
-                    else (self.max_model_len + self.compress_ratio - 1)
-                    // self.compress_ratio
-                )
-                M = N + self.window_size + self.max_num_batched_tokens
-                current_workspace_manager().get_simultaneous(
-                    ((self.PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
-                )
+            # / sparse_fwd kernels are skipped this step.
+            swa_only = self.compress_ratio <= 1
+            N = (
+                0
+                if swa_only
+                else (self.max_model_len + self.compress_ratio - 1)
+                // self.compress_ratio
+            )
+            M = N + self.window_size + self.max_num_batched_tokens
+            current_workspace_manager().get_simultaneous(
+                ((self.PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
+            )
             output.zero_()
             return
 
@@ -1382,22 +1357,6 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 topk_ragged_indices = attn_metadata.c128a_decode_topk_ragged_indices
                 topk_ragged_indptr = attn_metadata.c128a_decode_topk_ragged_indptr
 
-        if self._use_aiter_sparse_mla:
-            assert swa_metadata.decode_swa_ragged_indices is not None
-            assert swa_metadata.decode_swa_ragged_indptr is not None
-            self._aiter_sparse_mla(
-                q,
-                output,
-                self.swa_cache_layer.kv_cache,
-                swa_metadata.decode_swa_ragged_indices,
-                swa_metadata.decode_swa_ragged_indptr,
-                kv_cache,
-                topk_ragged_indices,
-                topk_ragged_indptr,
-            )
-            # The aiter kernel leaves the inverse RoPE to the caller.
-            return 0
-
         return rocm_sparse_attn_decode(
             q=q,
             kv_cache=kv_cache,
@@ -1427,6 +1386,71 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             ),
         )
 
+    def _prefill_chunk_slices(
+        self,
+        attn_metadata: DeepseekV4ROCMAiterMLASparseMetadata | None,
+        swa_metadata: DeepseekV4ROCMAiterSparseSWAMetadata,
+    ) -> list[_PrefillChunkSlices]:
+        cache_key = (
+            _LAYER_TYPE_SWAONLY
+            if attn_metadata is None
+            else (_LAYER_TYPE_C128A if self.compress_ratio == 128 else _LAYER_TYPE_C4A)
+        )
+        cached = swa_metadata.prefill_chunk_slices.get(cache_key)
+        if cached is not None:
+            return cached
+
+        seq_lens = swa_metadata.prefill_seq_lens
+        gather_lens = swa_metadata.prefill_gather_lens
+        query_start_loc_cpu = swa_metadata.query_start_loc_cpu
+        query_start_loc = swa_metadata.query_start_loc
+        assert seq_lens is not None
+        assert gather_lens is not None
+        assert query_start_loc_cpu is not None
+        assert query_start_loc is not None
+
+        num_decodes = swa_metadata.num_decodes
+        prefill_token_base = int(query_start_loc_cpu[num_decodes])
+        swa_block_table = swa_metadata.block_table[num_decodes:]
+        compressed_block_table = (
+            None if attn_metadata is None else attn_metadata.block_table[num_decodes:]
+        )
+
+        chunks: list[_PrefillChunkSlices] = []
+        for chunk_start in range(0, swa_metadata.num_prefills, self.PREFILL_CHUNK_SIZE):
+            chunk_end = min(
+                chunk_start + self.PREFILL_CHUNK_SIZE, swa_metadata.num_prefills
+            )
+            chunk_seq_lens = seq_lens[chunk_start:chunk_end]
+            chunks.append(
+                _PrefillChunkSlices(
+                    chunk_size=chunk_end - chunk_start,
+                    query_start=int(query_start_loc_cpu[num_decodes + chunk_start])
+                    - prefill_token_base,
+                    query_end=int(query_start_loc_cpu[num_decodes + chunk_end])
+                    - prefill_token_base,
+                    seq_lens=chunk_seq_lens,
+                    gather_lens=gather_lens[chunk_start:chunk_end],
+                    swa_block_table=swa_block_table[chunk_start:chunk_end],
+                    query_start_loc=query_start_loc[
+                        num_decodes + chunk_start : num_decodes + chunk_end + 1
+                    ],
+                    compressed_seq_lens=(
+                        None
+                        if compressed_block_table is None
+                        else chunk_seq_lens // self.compress_ratio
+                    ),
+                    compressed_block_table=(
+                        None
+                        if compressed_block_table is None
+                        else compressed_block_table[chunk_start:chunk_end]
+                    ),
+                )
+            )
+
+        swa_metadata.prefill_chunk_slices[cache_key] = chunks
+        return chunks
+
     def _forward_prefill(
         self,
         q: torch.Tensor,
@@ -1437,113 +1461,85 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
         attn_metadata: DeepseekV4ROCMAiterMLASparseMetadata | None,
         swa_metadata: DeepseekV4ROCMAiterSparseSWAMetadata,
     ) -> None:
-        if self._use_aiter_sparse_mla:
-            self._forward_prefill_aiter(
-                q=q,
-                compressed_k_cache=compressed_k_cache,
-                swa_k_cache=swa_k_cache,
-                output=output,
-                attn_metadata=attn_metadata,
-                swa_metadata=swa_metadata,
-            )
-            return
-
         swa_only = attn_metadata is None
 
         num_prefill_tokens = swa_metadata.num_prefill_tokens
-        num_decodes = swa_metadata.num_decodes
         num_decode_tokens = swa_metadata.num_decode_tokens
 
-        seq_lens = swa_metadata.prefill_seq_lens
-        gather_lens = swa_metadata.prefill_gather_lens
-        assert seq_lens is not None
-        assert gather_lens is not None
-
-        query_start_loc_cpu = swa_metadata.query_start_loc_cpu
-        query_start_loc = swa_metadata.query_start_loc
-        assert query_start_loc_cpu is not None
-        assert query_start_loc is not None
-        prefill_token_base = query_start_loc_cpu[num_decodes]
+        # seq_lens / gather_lens / query_start_loc are sliced in
+        # _build_prefill_chunk_slices; only the image visibility bounds are
+        # needed here, and they are indexed by prefill-relative token offset.
         left_visible = swa_metadata.prefill_left_visible
         right_visible = swa_metadata.prefill_right_visible
         if left_visible is not None:
             left_visible = left_visible[num_decode_tokens:]
             assert right_visible is not None
             right_visible = right_visible[num_decode_tokens:]
-
         if not swa_only:
+            assert attn_metadata is not None
             if self.compress_ratio == 4:
                 assert self.topk_indices_buffer is not None
                 topk_indices = self.topk_indices_buffer[num_decode_tokens:]
                 topk_indices = topk_indices[:num_prefill_tokens]
             else:
-                assert attn_metadata is not None
                 topk_indices = attn_metadata.c128a_prefill_topk_indices
             assert topk_indices is not None
             top_k = topk_indices.shape[-1]
+            N = (self.max_model_len + self.compress_ratio - 1) // self.compress_ratio
+            compressed_block_size = attn_metadata.block_size // self.compress_ratio
         else:
             assert self.topk_indices_buffer is not None
             topk_indices = self.topk_indices_buffer[num_decode_tokens:]
             top_k = 0
+            N = 0
+            compressed_block_size = 0
 
-        chunk_plan = swa_metadata.get_prefill_chunk_plan(
-            compress_ratio=self.compress_ratio,
-            prefill_chunk_size=self.PREFILL_CHUNK_SIZE,
-        )
-        assert chunk_plan, "prefill chunk plan must be non-empty when num_prefills > 0"
+        M = N + self.window_size + self.max_num_batched_tokens
+
         workspace_manager = current_workspace_manager()
-        for chunk_start, chunk_end, chunk_N, chunk_M in chunk_plan:
-            chunk_size = chunk_end - chunk_start
-            kv = workspace_manager.get_simultaneous(
-                ((chunk_size, chunk_M, q.shape[-1]), torch.bfloat16),
-            )[0]
+        kv = workspace_manager.get_simultaneous(
+            ((self.PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
+        )[0]
+        for chunk in self._prefill_chunk_slices(attn_metadata, swa_metadata):
+            query_start = chunk.query_start
+            query_end = chunk.query_end
             if not swa_only:
-                assert attn_metadata is not None
                 assert compressed_k_cache is not None
-                block_table = attn_metadata.block_table[num_decodes:]
+                assert chunk.compressed_seq_lens is not None
+                assert chunk.compressed_block_table is not None
                 # compressed_k_cache is OCP on every platform (Triton encoder).
                 dequantize_and_gather_k_cache(
-                    kv[:chunk_size],
+                    kv[: chunk.chunk_size],
                     compressed_k_cache,
-                    seq_lens=seq_lens[chunk_start:chunk_end] // self.compress_ratio,
+                    seq_lens=chunk.compressed_seq_lens,
                     gather_lens=None,
-                    block_table=block_table[chunk_start:chunk_end],
-                    block_size=attn_metadata.block_size // self.compress_ratio,
+                    block_table=chunk.compressed_block_table,
+                    block_size=compressed_block_size,
                     offset=0,
                     use_fnuz=False,
                 )
 
-            swa_block_table = swa_metadata.block_table[num_decodes:]
             dequantize_and_gather_k_cache(
-                kv[:chunk_size],
+                kv[: chunk.chunk_size],
                 swa_k_cache,
-                seq_lens=seq_lens[chunk_start:chunk_end],
-                gather_lens=gather_lens[chunk_start:chunk_end],
-                block_table=swa_block_table[chunk_start:chunk_end],
+                seq_lens=chunk.seq_lens,
+                gather_lens=chunk.gather_lens,
+                block_table=chunk.swa_block_table,
                 block_size=swa_metadata.block_size,
-                offset=chunk_N,
+                offset=N,
                 use_fnuz=current_platform.is_fp8_fnuz(),
-            )
-
-            query_start = (
-                query_start_loc_cpu[num_decodes + chunk_start] - prefill_token_base
-            )
-            query_end = (
-                query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
             )
 
             combined_indices, combined_lens = combine_topk_swa_indices(
                 topk_indices[query_start:query_end],
-                query_start_loc[
-                    num_decodes + chunk_start : num_decodes + chunk_end + 1
-                ],
-                seq_lens[chunk_start:chunk_end],
-                gather_lens[chunk_start:chunk_end],
+                chunk.query_start_loc,
+                chunk.seq_lens,
+                chunk.gather_lens,
                 self.window_size,
                 self.compress_ratio,
                 top_k,
-                chunk_M,
-                chunk_N,
+                M,
+                N,
                 max_image_tokens=self.max_image_tokens,
                 left_visible=(
                     left_visible[query_start:query_end]
@@ -1568,90 +1564,3 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 attn_sink=self.attn_sink,
                 output=output[query_start:query_end],
             )
-
-    def _forward_prefill_aiter(
-        self,
-        q: torch.Tensor,
-        compressed_k_cache: torch.Tensor | None,
-        swa_k_cache: torch.Tensor,
-        output: torch.Tensor,
-        attn_metadata: DeepseekV4ROCMAiterMLASparseMetadata | None,
-        swa_metadata: DeepseekV4ROCMAiterSparseSWAMetadata,
-    ) -> None:
-        """Prefill straight off the paged caches, with no bf16 gather."""
-        num_decode_tokens = swa_metadata.num_decode_tokens
-        num_prefill_tokens = swa_metadata.num_prefill_tokens
-        assert swa_metadata.prefill_swa_ragged_indices is not None
-        assert swa_metadata.prefill_swa_ragged_indptr is not None
-
-        topk_ragged_indices = None
-        topk_ragged_indptr = None
-        if attn_metadata is None:
-            compressed_k_cache = None
-        else:
-            assert compressed_k_cache is not None
-            assert swa_metadata.token_to_req_indices is not None
-            assert swa_metadata.query_start_loc is not None
-            assert swa_metadata.seq_lens is not None
-            assert swa_metadata.is_valid_token is not None
-            if self.compress_ratio == 4:
-                assert self.topk_indices_buffer is not None
-                topk_indices = self.topk_indices_buffer[
-                    num_decode_tokens : num_decode_tokens + num_prefill_tokens
-                ]
-            else:
-                topk_indices = attn_metadata.c128a_prefill_topk_indices
-            assert topk_indices is not None
-            topk_ragged_indices, topk_ragged_indptr = build_prefill_topk_ragged_indices(
-                topk_indices,
-                swa_metadata.token_to_req_indices,
-                swa_metadata.query_start_loc,
-                swa_metadata.seq_lens,
-                swa_metadata.is_valid_token,
-                attn_metadata.block_table,
-                block_size=attn_metadata.block_size // self.compress_ratio,
-                compress_ratio=self.compress_ratio,
-                num_compressed=(self.max_model_len + self.compress_ratio - 1)
-                // self.compress_ratio,
-                token_offset=num_decode_tokens,
-                num_rows=compressed_k_cache.shape[0] * compressed_k_cache.shape[1],
-            )
-
-        self._aiter_sparse_mla(
-            q[:num_prefill_tokens],
-            output[:num_prefill_tokens],
-            swa_k_cache,
-            swa_metadata.prefill_swa_ragged_indices,
-            swa_metadata.prefill_swa_ragged_indptr,
-            compressed_k_cache,
-            topk_ragged_indices,
-            topk_ragged_indptr,
-        )
-
-    def _aiter_sparse_mla(
-        self,
-        q: torch.Tensor,
-        output: torch.Tensor,
-        swa_k_cache: torch.Tensor,
-        swa_indices: torch.Tensor,
-        swa_indptr: torch.Tensor,
-        compressed_k_cache: torch.Tensor | None,
-        topk_indices: torch.Tensor | None,
-        topk_indptr: torch.Tensor | None,
-    ) -> None:
-        from vllm._aiter_ops import rocm_aiter_ops
-
-        # Both fp8 caches are read in place: the SWA window as the main segment,
-        # the top-k compressed tokens as the extra one.
-        rocm_aiter_ops.triton_sparse_mla_fwd(
-            q,
-            swa_k_cache,
-            output,
-            self.scale,
-            swa_indptr,
-            swa_indices,
-            attn_sink=self.attn_sink[: q.shape[1]],
-            extra_kv_buffer=compressed_k_cache,
-            extra_kv_indptr=topk_indptr,
-            extra_kv_indices=topk_indices,
-        )
