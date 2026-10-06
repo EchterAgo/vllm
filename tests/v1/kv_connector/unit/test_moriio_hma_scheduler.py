@@ -537,7 +537,10 @@ def _make_read_request(remote_block_ids):
 
 @pytest.mark.parametrize("external_tokens", [0, 256])
 @pytest.mark.parametrize("has_mamba", [False, True])
-@pytest.mark.parametrize("zero_ids", [None, [], [101], [101, 102, 202, 999]])
+@pytest.mark.parametrize(
+    "zero_ids",
+    [None, [], [[101]], [[101, 102], [202, 999]]],
+)
 def test_update_state_drops_decode_recompute_tail_block(
     external_tokens, has_mamba, zero_ids
 ):
@@ -561,19 +564,24 @@ def test_update_state_drops_decode_recompute_tail_block(
     assert sched._req_kv_params["req"]["remote_block_ids"] == remote_blocks
 
     output = SchedulerOutput.make_empty()
-    output.new_block_ids_to_zero = None if zero_ids is None else list(zero_ids)
+    output.new_block_ids_to_zero = (
+        None if zero_ids is None else [list(g) for g in zero_ids]
+    )
     before = asdict(output)
     meta = sched.build_connector_meta(output)
     assert meta.reqs_to_recv["req"].local_block_ids == expected_blocks
     if zero_ids and has_mamba and external_tokens:
-        before["new_block_ids_to_zero"] = zero_ids[1:]
+        # READ destinations are exempted from zeroing, per group.
+        before["new_block_ids_to_zero"] = [
+            [b for b in g if b not in {100, 101}] for g in zero_ids
+        ]
     assert asdict(output) == before
 
     # A later local allocation of the same pages must still be zeroed.
-    output.new_block_ids_to_zero = [100, 101, 102]
+    output.new_block_ids_to_zero = [[100, 101, 102]]
     meta = sched.build_connector_meta(output)
     assert not meta.reqs_to_recv
-    assert output.new_block_ids_to_zero == [100, 101, 102]
+    assert output.new_block_ids_to_zero == [[100, 101, 102]]
 
 
 def test_update_state_pairs_shorter_local_blocks_with_remote_suffix():

@@ -830,12 +830,14 @@ class KVCacheManager:
             truncated.append(list(group_blocks[:num_blocks]))
         return self.create_kv_cache_blocks(tuple(truncated))
 
-    def take_new_block_ids(self) -> list[int]:
-        """Drain and return new attention block IDs for zeroing."""
-        ids: list[int] = []
-        for mgr in self.coordinator.single_type_managers:
-            ids.extend(mgr.take_new_block_ids())
-        return ids
+    def take_new_block_ids(self) -> list[list[int]]:
+        """Drain and return new attention block IDs for zeroing.
+
+        Per kv-cache group: block ids are group-scoped (the worker's zeroer
+        maps an id to different physical pages in groups with different
+        geometry), so the list must not be flattened across managers.
+        """
+        return [mgr.take_new_block_ids() for mgr in self.coordinator.single_type_managers]
 
     def record_blocks_for_zeroing(self, request_id: str, start_token: int) -> None:
         """Re-record the request's blocks from start_token onwards for
