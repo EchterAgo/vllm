@@ -870,6 +870,9 @@ def _build_deepseek_v4(
     scenario: Scenario, validate: bool = True, *, v41: bool = False
 ) -> Sample:
     thinking = scenario.reasoning is not None
+    # Pin the mode explicitly: since the 0731 contract the parser defaults to
+    # thinking mode when the kwargs are silent, and these chat-style samples
+    # emit their own <think> tags in-output.
     chat_kwargs = {"thinking": thinking}
     parser_cls = DeepSeekV41Parser if v41 else DeepSeekV4Parser
     model = "deepseek_v41" if v41 else "deepseek_v4"
