@@ -15,6 +15,7 @@ from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     FullAttentionSpec,
+    KpoolTailSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     MambaSpec,
@@ -64,7 +65,11 @@ def test_non_last_pp_rank_uses_global_batch_for_sample_feedback():
     runner.pcp_manager.restore_for_sampling.assert_not_called()
 
 
-def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):
+@pytest.mark.parametrize("spec_kind", ["circular", "kpool_tail"])
+def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch, spec_kind):
+    """Ring-buffer caches (QSA circular buffer, GLM-5.3 kpool tail) hold one
+    block per request and compute their own slot mapping; the generic
+    position-indexed mapping would index far past their 1-block table row."""
     runner = GPUModelRunner.__new__(GPUModelRunner)
     runner.max_model_len = 262144
     runner.is_encoder_decoder = False
@@ -94,12 +99,21 @@ def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):
     runner.max_num_tokens = 2
     runner.device = torch.device("cuda")
 
-    raw_spec = CircularBufferSpec(
-        block_size=8,
-        num_kv_heads=1,
-        head_size=128,
-        dtype=torch.bfloat16,
-    )
+    if spec_kind == "circular":
+        raw_spec = CircularBufferSpec(
+            block_size=8,
+            num_kv_heads=1,
+            head_size=128,
+            dtype=torch.bfloat16,
+        )
+    else:
+        raw_spec = KpoolTailSpec(
+            block_size=8,
+            num_kv_heads=1,
+            head_size=128,
+            dtype=torch.bfloat16,
+            sliding_window=8,
+        )
     compressed_spec = FullAttentionSpec(
         block_size=262144,
         num_kv_heads=1,
