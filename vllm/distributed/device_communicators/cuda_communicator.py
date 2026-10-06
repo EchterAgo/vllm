@@ -10,6 +10,7 @@ from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import get_current_vllm_config_or_none
 from vllm.distributed.device_communicators.all_reduce_utils import (
     NCCL_SYMM_MEM_ALL_REDUCE_CONFIG,
+    MiB,
     should_nccl_symm_mem_ag_rs,
     should_nccl_symm_mem_allreduce,
 )
@@ -97,6 +98,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
         from vllm.distributed.device_communicators.flashinfer_pcie_ipc_all_reduce import (  # noqa: E501
             FlashInferPcieIpcAllReduce,
         )
+        from vllm.distributed.device_communicators.hier_all_reduce import (
+            HierarchicalAllReduce,
+        )
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
         from vllm.distributed.device_communicators.quick_all_reduce import (
             QuickAllReduce,
@@ -156,6 +160,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         if use_custom_allreduce and self.aiter_ar_comm is None and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
+            # The default cap (8 MB) is below a tensor-parallel prefill step's
+            # payload, so those all-reduces fall back to NCCL; raising it is
+            # opt-in because it costs an IPC-registered buffer of that size.
+            max_size_mb = envs.VLLM_MAX_SIZE_MB_CUSTOM_ALL_REDUCE
+            extra = {} if max_size_mb is None else {"max_size": max_size_mb * MiB}
             self.ca_comm = CustomAllreduce(
                 group=self.cpu_group,
                 device=self.device,
@@ -163,7 +172,26 @@ class CudaCommunicator(DeviceCommunicatorBase):
                     self.symm_mem_comm is not None and not self.symm_mem_comm.disabled
                 ),
                 register_graph_buffers=register,
+                **extra,
             )
+
+        self.hier_ar_comm: HierarchicalAllReduce | None = None
+        if envs.VLLM_HIER_ALL_REDUCE and self.world_size > 1:
+            islands = [
+                [int(r) for r in part.split(",")]
+                for part in envs.VLLM_HIER_ALL_REDUCE.split(";")
+            ]
+            if sorted(r for i in islands for r in i) == list(range(self.world_size)):
+                self.hier_ar_comm = HierarchicalAllReduce(
+                    self.cpu_group, self.device, islands
+                )
+            else:
+                logger.warning(
+                    "VLLM_HIER_ALL_REDUCE=%s does not cover ranks 0..%d exactly; "
+                    "hierarchical allreduce disabled.",
+                    envs.VLLM_HIER_ALL_REDUCE,
+                    self.world_size - 1,
+                )
 
         # AITER custom all-gather/reduce-scatter DP-attention dispatch/combine
         if (
@@ -404,6 +432,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
             out = aiter_ar_comm.custom_all_reduce(input_)
             assert out is not None
             return out
+        hier_ar_comm = self.hier_ar_comm
+        if hier_ar_comm is not None and hier_ar_comm.should_use(input_):
+            return hier_ar_comm.all_reduce(input_)
         ca_comm = self.ca_comm
         if (
             ca_comm is not None
@@ -809,6 +840,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self.pynccl_comm = None
         if self.ca_comm is not None:
             self.ca_comm = None
+        if self.hier_ar_comm is not None:
+            self.hier_ar_comm = None
         if self.aiter_ar_comm is not None:
             self.aiter_ar_comm.close()
             self.aiter_ar_comm = None

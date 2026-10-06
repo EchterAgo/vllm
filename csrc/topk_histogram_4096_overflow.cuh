@@ -235,7 +235,11 @@ __device__ void exact_topk_rescan(const float* __restrict__ scores,
           });
     }
   } else {
-    scan_scores<BlockSize, VecSize>(scores, length, collect);
+    // Cold path (persistent-kernel short/decode): deterministic index-ordered
+    // scatter so temp=0 decoding is bit-reproducible (#50576). The histogram
+    // is free after the radix rounds, so reuse it as the prefix-scan scratch.
+    index_order_scatter<BlockSize>(scores, length, output, equal_count, pivot,
+                                   smem->histogram);
   }
   __syncthreads();
 }
