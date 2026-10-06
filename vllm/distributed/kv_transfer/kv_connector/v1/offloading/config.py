@@ -84,6 +84,34 @@ def get_sliding_window_size_in_chunks(
     return None
 
 
+def compute_worker_kv_bytes_per_block(
+    kv_cache_config: "KVCacheConfig",
+    selected_groups: tuple[tuple[int, "KVCacheGroupSpec"], ...] | None = None,
+) -> int:
+    """Per-worker KV bytes per block from this worker's kv_cache_config.
+
+    ``selected_groups`` limits the total to the groups an offloading connector
+    actually uses; without it, every group counts.
+    """
+    if kv_cache_config.num_blocks <= 0:
+        return 0
+    groups = (
+        tuple(enumerate(kv_cache_config.kv_cache_groups))
+        if selected_groups is None
+        else selected_groups
+    )
+    if (
+        len(groups) == len(kv_cache_config.kv_cache_groups)
+        and kv_cache_config.hisparse_host_num_blocks is None
+        and kv_cache_config.kv_cache_tensors
+    ):
+        # Every KVCacheTensor describes placement within the same backing allocation,
+        # so its size is the total, not a per-tensor share.
+        total_gpu_kv_bytes = kv_cache_config.kv_cache_tensors[0].size
+        return total_gpu_kv_bytes // kv_cache_config.num_blocks
+    return sum(_group_kv_bytes_per_block(group) for _, group in groups)
+
+
 def build_offloading_config(
     vllm_config: "VllmConfig",
     kv_cache_config: "KVCacheConfig",
@@ -172,20 +200,23 @@ def build_offloading_config(
         )
     )
 
-    worker_kv_bytes_per_block = 0
-    if (
-        kv_cache_config.hisparse_host_num_blocks is None
-        and kv_cache_config.num_blocks > 0
-        and kv_cache_config.kv_cache_tensors
-    ):
-        # Scratch filtering must preserve the scheduler/worker allocation stride.
-        # Every KVCacheTensor describes placement within the same backing allocation,
-        # so its size is the total, not a per-tensor share.
-        total_gpu_kv_bytes = kv_cache_config.kv_cache_tensors[0].size
-        worker_kv_bytes_per_block = total_gpu_kv_bytes // kv_cache_config.num_blocks
-    elif kv_cache_config.num_blocks > 0:
-        worker_kv_bytes_per_block = sum(
-            _group_kv_bytes_per_block(group) for _, group in selected_groups
+    worker_kv_bytes_per_block = compute_worker_kv_bytes_per_block(
+        kv_cache_config, selected_groups
+    )
+    # With pipeline parallelism the PP stages hold different layer sets, so
+    # their local per-block byte counts differ. The shared-memory offload
+    # region is one file with one geometry shared by every process; size the
+    # per-worker slot by the global maximum (attached to KVCacheConfig by the
+    # engine) so all processes agree. Smaller stages just leave the slot tail
+    # unused (create_next_view fills slots front-to-back and asserts bounds).
+    global_max = getattr(kv_cache_config, "max_worker_kv_bytes_per_block", 0)
+    if global_max > worker_kv_bytes_per_block:
+        worker_kv_bytes_per_block = global_max
+    elif 0 < global_max < worker_kv_bytes_per_block:
+        raise ValueError(
+            f"max_worker_kv_bytes_per_block={global_max} is smaller than this "
+            f"worker's local value {worker_kv_bytes_per_block}; the engine-"
+            "computed maximum must cover every worker."
         )
 
     single_group_spec = (
