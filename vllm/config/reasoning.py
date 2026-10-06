@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import field
+from typing import Any
+
+from pydantic import field_validator
 
 from vllm.config.model import ModelConfig
 from vllm.config.utils import config
@@ -25,6 +28,25 @@ class ReasoningConfig:
     """String that indicates the start of reasoning."""
     reasoning_end_str: str = ""
     """String forced when the thinking budget is exhausted."""
+    default_thinking_token_budget: int | None = None
+    """Server-wide default for the per-request `thinking_token_budget` sampling
+    parameter. Applied to any request that does not set one explicitly, so the
+    reasoning block is capped even when the client omits the parameter. A
+    request-level `thinking_token_budget` always takes priority. `-1` (or
+    `null`) means no default limit is applied."""
+
+    @field_validator("default_thinking_token_budget", mode="before")
+    @classmethod
+    def _validate_default_thinking_token_budget(cls, value: Any) -> int | None:
+        # Mirror SamplingParams.thinking_token_budget: -1 means unlimited.
+        if value == -1:
+            return None
+        if value is not None and (isinstance(value, bool) or value < 0):
+            raise ValueError(
+                "`default_thinking_token_budget` must be a non-negative integer "
+                "or -1 for unlimited."
+            )
+        return value
 
     _reasoning_start_token_ids: list[int] | None = field(
         default=None, init=False, repr=False
