@@ -144,7 +144,11 @@ def test_k3_dspark_uses_replicated_markov_head(monkeypatch: pytest.MonkeyPatch):
         speculative_config=SimpleNamespace(
             draft_model_config=SimpleNamespace(hf_config=config)
         ),
-        scheduler_config=SimpleNamespace(max_num_batched_tokens=16),
+        # K3DSparkModel.__init__ sizes its context-KV buffer from the scheduler
+        # budget (dspark_mla.py:150-152), so the stand-in config has to carry
+        # it. The value is arbitrary here -- nothing in this test reaches the
+        # buffer -- but it must exist.
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=2048),
     )
 
     K3DSparkModel(vllm_config=vllm_config, start_layer_id=0, prefix="model")
