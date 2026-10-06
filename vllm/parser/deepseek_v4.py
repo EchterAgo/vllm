@@ -49,6 +49,9 @@ DSML_INVOKE_NAME_END = '">'
 DSML_INVOKE_END = f"</{_DSML}invoke>"
 DSML_PARAM_START = f"<{_DSML}parameter"
 DSML_PARAM_CLOSE = f"</{_DSML}parameter>"
+# DeepSeek V3.2-style wrapper, recognized only to reject it as foreign
+DSML_FOREIGN_TOOL_START = f"<{_DSML}function_calls>"
+DSML_FOREIGN_TOOL_END = f"</{_DSML}function_calls>"
 
 # Spellings variants of ``DSML_TOOL_START`` observed in production.
 DSML_TOOL_START_VARIANTS: tuple[str, ...] = (
@@ -159,6 +162,8 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
             "INVOKE_END": DSML_INVOKE_END,
             "PARAM_START": DSML_PARAM_START,
             "PARAM_CLOSE": DSML_PARAM_CLOSE,
+            "FOREIGN_START": DSML_FOREIGN_TOOL_START,
+            "FOREIGN_END": DSML_FOREIGN_TOOL_END,
         },
         token_id_terminals={
             "THINK_START": DSML_THINK_START,
@@ -194,11 +199,34 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
                 ParserState.TOOL_PREAMBLE,
                 (),
             ),
-            (ParserState.TOOL_PREAMBLE, "INVOKE_PREFIX"): Transition(
+            # Orphan invoke: at long context the model may omit the
+            # <｜DSML｜tool_calls> wrapper and emit the invoke directly.
+            # The invoke marker has no dedicated special token, so hold
+            # events and validate the parsed name before committing.
+            # Only names the request declared are accepted.
+            (ParserState.CONTENT, "INVOKE_PREFIX"): Transition(
                 ParserState.TOOL_NAME,
                 (EventType.TOOL_CALL_START,),
+                validate_tool_name=True,
             ),
-            (ParserState.CONTENT, "INVOKE_PREFIX"): Transition(
+            # V3.2-style function_calls wrapper is foreign to V4: pass
+            # it and its contents through as plain content
+            (ParserState.CONTENT, "FOREIGN_START"): Transition(
+                ParserState.FOREIGN_BLOCK,
+                (EventType.TEXT_CHUNK,),
+            ),
+            (ParserState.FOREIGN_BLOCK, "FOREIGN_END"): Transition(
+                ParserState.CONTENT,
+                (EventType.TEXT_CHUNK,),
+            ),
+            # The native wrapper always wins over an unclosed foreign
+            # block, so a stray foreign start cannot disable tool
+            # parsing for the rest of the response.
+            (ParserState.FOREIGN_BLOCK, "TOOL_START"): Transition(
+                ParserState.TOOL_PREAMBLE,
+                (),
+            ),
+            (ParserState.TOOL_PREAMBLE, "INVOKE_PREFIX"): Transition(
                 ParserState.TOOL_NAME,
                 (EventType.TOOL_CALL_START,),
             ),
@@ -235,6 +263,7 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
             ParserState.REASONING: EventType.REASONING_CHUNK,
             ParserState.TOOL_NAME: EventType.TOOL_NAME,
             ParserState.TOOL_ARGS: EventType.ARG_VALUE_CHUNK,
+            ParserState.FOREIGN_BLOCK: EventType.TEXT_CHUNK,
         },
         arg_converter=_dsml_arg_converter,
         arg_structural_chars=frozenset(">"),
@@ -253,10 +282,16 @@ class DeepSeekV4Parser(ParserEngine):
         **kwargs,
     ) -> None:
         chat_kwargs = kwargs.pop("chat_template_kwargs", None) or {}
-        thinking = bool(
-            chat_kwargs.get("thinking") or chat_kwargs.get("enable_thinking")
-        )
-        if "thinking" not in chat_kwargs and "enable_thinking" not in chat_kwargs:
+        # Mirror the tokenizer's apply_chat_template default exactly: omitted
+        # thinking/enable_thinking means thinking mode (the 0731 contract).
+        # A parser default that disagrees with the template leaves the state
+        # machine in CONTENT while the model is inside an open <think> block,
+        # so reasoning streams out as content.
+        if "thinking" in chat_kwargs or "enable_thinking" in chat_kwargs:
+            thinking = bool(
+                chat_kwargs.get("thinking") or chat_kwargs.get("enable_thinking")
+            )
+        else:
             thinking = True
         thinking = thinking and chat_kwargs.get("reasoning_effort") != "none"
         super().__init__(
