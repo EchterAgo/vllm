@@ -76,6 +76,7 @@ from vllm.model_executor.models.interfaces import (
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
+    get_pp_missing_layer_names,
     init_vllm_registered_model,
     is_pp_missing_parameter,
     make_layers,
@@ -790,6 +791,30 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         completed = self._aux_post_op(hidden_states, residual, post, comb)
         return hc_contract(completed, self.config.hc_mult)
 
+    def make_empty_intermediate_tensors(
+        self,
+        batch_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> IntermediateTensors:
+        # PP intermediates carry the full multi-stream mHC state
+        # (tokens, n, hidden_size): every mHC layer's output is a stream
+        # state whose deferred hc_post is materialized at the boundary
+        # (see Glm5NextModel.forward). Mirrors DSV4's hc_mult hand-off.
+        # Only key "hidden_states"; residual/post/comb are re-derived on
+        # the receiving rank by standalone hc_pre.
+        if getattr(self.config, "mhc", False):
+            shape = (
+                batch_size,
+                self.config.mhc_num_residual_streams,
+                self.config.hidden_size,
+            )
+        else:
+            shape = (batch_size, self.config.hidden_size)
+        return IntermediateTensors(
+            {"hidden_states": torch.zeros(shape, dtype=dtype, device=device)}
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -808,10 +833,14 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             comb = None
         else:
             assert intermediate_tensors is not None
+            # The sending rank materialized its last layer's deferred
+            # hc_post, so "hidden_states" arrives as the FULL multi-stream
+            # mHC state (tokens, n * hidden) — the same hand-off DSV4 uses.
+            # The stage's first layer (post is None, layer_idx > 0) re-sets
+            # residual = x in its standalone-hc_pre branch, so no separate
+            # residual key is transported.
             hidden_states = intermediate_tensors["hidden_states"]
-            residual = intermediate_tensors["residual"]
-            # post/comb (deferred mHC hc_post state) are not propagated across
-            # PP ranks; the receiving rank's first mHC layer uses standalone pre.
+            residual = None
             post = None
             comb = None
 
@@ -833,14 +862,19 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             )
 
         if not get_pp_group().is_last_rank:
-            # PP is gated off for GLM-5.3-Flash (no make_empty_intermediate_tensors),
-            # so this branch is not exercised. post/comb are the deferred
-            # hc_post state of this rank's last mHC layer; a future PP path
-            # would need to propagate them, but for now they are dropped (the
-            # receiving rank's first layer would fall back to standalone pre).
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
+            # PP hand-off (DSV4 pattern): materialize this rank's last mHC
+            # layer's deferred hc_post so the full multi-stream state
+            # ([tokens, n, hidden]) crosses the boundary in one key. The
+            # mhc_post kernel here is exactly the post that the next rank's
+            # first layer would have folded into its fused_post_pre, so the
+            # math is unchanged (one extra post kernel per boundary).
+            # post/comb stay None on the receiving rank: its first layer runs
+            # standalone hc_pre on the materialized stream state.
+            if post is not None:
+                hidden_states = self._active_layers[-1].mhc_post_op(
+                    hidden_states, residual, post, comb
+                )
+            return IntermediateTensors({"hidden_states": hidden_states})
 
         if self.end_layer in self.aux_hidden_state_layers:
             final_aux = self._aux_hidden_state(hidden_states, residual, post, comb)
@@ -904,6 +938,7 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             expert_params_mapping = []
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        pp_missing_layer_names = get_pp_missing_layer_names(self)
 
         # GLM-5.3-Flash NoPE checkpoints omit the RoPE rows from
         # ``kv_a_proj_with_mqa``; pad them with zeros for the model shape.
@@ -937,6 +972,7 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
                 _pending_wk_fp8,
                 params_dict,
                 loaded_params,
+                pp_missing_layer_names,
             ):
                 continue
 
@@ -949,6 +985,7 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
                 params_dict,
                 loaded_params,
                 kv_a_pad_size,
+                pp_missing_layer_names,
             ):
                 continue
 
@@ -1056,6 +1093,11 @@ class Glm5NextForCausalLM(
         self.quant_config = quant_config
         self.model = Glm5NextModel(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+        )
+        # PP is supported: Glm5NextModel transports the materialized mHC
+        # multi-stream state across stage boundaries (DSV4 pattern).
+        self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
+            self.model.make_empty_intermediate_tensors
         )
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
@@ -1232,9 +1274,13 @@ class Glm5NextForConditionalGeneration(
 
         self.set_moe_parameters()
 
-        # Glm5NextForCausalLM does not implement make_empty_intermediate_tensors,
-        # so pipeline parallelism is gated off (consistent with the text-only
-        # model) and we intentionally do not alias it here.
+        # PP support: the language model transports the materialized mHC
+        # multi-stream state across stage boundaries (DSV4 pattern). The
+        # Glm4v __init__ (which would alias this automatically) is skipped
+        # above, so alias it explicitly.
+        self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
+            self.language_model.make_empty_intermediate_tensors
+        )
 
     def set_moe_parameters(self) -> None:
         self.moe_mlp_layers = [
@@ -1353,7 +1399,9 @@ def _fused_shared_expert_name(name: str, n_routed_experts: int) -> str:
     return name.replace("mlp.shared_experts.", f"mlp.experts.{n_routed_experts}.", 1)
 
 
-def _try_load_fp8_indexer_wk(name, tensor, buf, params_dict, loaded_params):
+def _try_load_fp8_indexer_wk(
+    name, tensor, buf, params_dict, loaded_params, pp_missing_layer_names
+):
     if "indexer.wk." not in name or "wk_weights" in name:
         return False
     is_weight = name.endswith(".weight") and tensor.dtype == torch.float8_e4m3fn
@@ -1361,6 +1409,11 @@ def _try_load_fp8_indexer_wk(name, tensor, buf, params_dict, loaded_params):
     if not is_weight and not is_scale:
         return False
     layer_prefix = name.rsplit(".wk.", 1)[0]
+    if any(
+        name.startswith(missing_layer_name)
+        for missing_layer_name in pp_missing_layer_names
+    ):
+        return True
     entry = buf.setdefault(layer_prefix, {})
     entry["weight" if is_weight else "scale"] = tensor
     if "weight" not in entry or "scale" not in entry:
@@ -1427,6 +1480,7 @@ def _try_load_fp8_attn_proj(
     params_dict,
     loaded_params,
     kv_a_pad_size: int,
+    pp_missing_layer_names,
 ) -> bool:
     """Dequantize FP8 q_a_proj / kv_a_proj_with_mqa / o_proj to BF16 on load.
 
@@ -1451,6 +1505,11 @@ def _try_load_fp8_attn_proj(
     is_scale = "weight_scale_inv" in name or name.endswith(".weight_scale")
     if not is_weight and not is_scale:
         return False
+    if any(
+        name.startswith(missing_layer_name)
+        for missing_layer_name in pp_missing_layer_names
+    ):
+        return True
 
     layer_prefix = name.rsplit(suffix, 1)[0]
     target_w = f"{layer_prefix}.{target_base}.weight"
