@@ -1455,6 +1455,7 @@ class DeepseekV4Indexer(nn.Module):
                 candidate_blocks=candidate_block_buffer,
                 candidate_block_size=candidate_block_size,
                 candidate_write=candidate_write,
+                num_heads=self.n_head,
             )
         # The fused Q kernel writes the per-head weights in the dtype the
         # scoring kernels take, so no cast runs per step.

@@ -1544,6 +1544,7 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
             if isinstance(module, DeepseekV4ROCMAiterMLAAttention):
                 fused_compressor_layers += module.prepare_compressor_gemm_fusion()
                 module.prepare_attn_preshuffle()
+                module.fuse_input_gemm_weights()
             elif isinstance(module, DeepseekV4MLP):
                 module.prepare_gateup_preshuffle()
         if fused_compressor_layers:

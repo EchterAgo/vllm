@@ -31,6 +31,7 @@ from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
 )
 from vllm.models.deepseek_v4.compressor import _get_c128_boundary
 from vllm.platforms import current_platform
+from vllm.utils.import_utils import is_cutedsl_supported
 from vllm.v1.attention.backends.mla.compressor_utils import (
     get_dspark_swa_index_width,
 )
@@ -2491,6 +2492,11 @@ def test_fused_kv_insert_indexer(
                 )
 
 
+@pytest.mark.skipif(
+    not is_cutedsl_supported(),
+    reason="CuTe DSL kernels compile only for SM90+; the package importing "
+    "fine is not a usable gate (the sm_80 compile aborts)",
+)
 @pytest.mark.parametrize("compress_ratio", [4, 128])
 @pytest.mark.parametrize("store_fp8", [False, True])
 def test_cutedsl_full_cache_store(compress_ratio: int, store_fp8: bool):
@@ -2499,7 +2505,6 @@ def test_cutedsl_full_cache_store(compress_ratio: int, store_fp8: bool):
     Exercises the contiguous bf16 / per-tensor fp8 store branch of both the C4
     fused kernel and the C128 split kernel against the PyTorch reference.
     """
-    cutedsl = pytest.importorskip("cutlass")  # noqa: F841
     from vllm.models.deepseek_v4.nvidia.ops.sparse_attn_compress_cutedsl import (
         fused_kv_compress_norm_rope_insert_sparse_attn_cutedsl,
         split_kv_compress_norm_rope_insert_sparse_attn_cutedsl,

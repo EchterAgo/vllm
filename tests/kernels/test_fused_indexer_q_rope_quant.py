@@ -27,7 +27,7 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
 from vllm.models.deepseek_v4.common.ops import fused_indexer_q_rope_quant
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import mqa_logits_use_mx_scales
-from vllm.utils.import_utils import has_cutedsl
+from vllm.utils.import_utils import is_cutedsl_supported
 
 HEAD_DIM = 128
 ROPE_DIM = 64
@@ -154,8 +154,11 @@ def _reference(
 def test_fused_indexer_q_rope_quant_matches_unfused(
     num_tokens, cache_dtype, use_fp4, use_cutedsl, n_head
 ):
-    if use_cutedsl and not has_cutedsl():
-        pytest.skip("cutedsl (cutlass) not installed")
+    if use_cutedsl and not is_cutedsl_supported():
+        # Package presence is not the dispatch gate -- the kernels need SM90+,
+        # so on older arches `has_cutedsl()` is True while the dispatcher still
+        # takes the Triton path, and this arm would test it under the wrong name.
+        pytest.skip("cutedsl unsupported here (needs the package and SM90+)")
 
     device = "cuda"
     torch.manual_seed(0)
@@ -184,11 +187,29 @@ def test_fused_indexer_q_rope_quant_matches_unfused(
         n_head,
         use_fp4,
     )
-    # use_cutedsl=False: force the triton path even when cutedsl is installed
-    # by patching the dispatcher's has_cutedsl() binding to return False.
+    output_buffers: tuple[torch.Tensor, ...] | None = None
+    OUTPUT_BUFFER_TEST_NUM_TOKENS = 7
+    if num_tokens == OUTPUT_BUFFER_TEST_NUM_TOKENS and cache_dtype == torch.float32:
+        if use_fp4:
+            q_ref, q_scale_ref = q_quant_ref
+            output_buffers = (
+                torch.empty_like(q_ref),
+                torch.empty_like(q_scale_ref)
+                .view(torch.uint8)
+                .reshape(num_tokens, n_head, -1),
+                torch.empty_like(weights_ref),
+            )
+        else:
+            output_buffers = (
+                torch.empty_like(q_quant_ref),
+                torch.empty_like(weights_ref),
+            )
+    # use_cutedsl=False: force the triton path even when cutedsl is usable, by
+    # patching the binding the dispatcher actually calls (fused_indexer_q.py
+    # imports `is_cutedsl_supported`, and never bound `has_cutedsl`).
     cutedsl_patch = (
         mock.patch(
-            "vllm.models.deepseek_v4.common.ops.fused_indexer_q.has_cutedsl",
+            "vllm.models.deepseek_v4.common.ops.fused_indexer_q.is_cutedsl_supported",
             return_value=False,
         )
         if not use_cutedsl
@@ -203,7 +224,14 @@ def test_fused_indexer_q_rope_quant_matches_unfused(
             softmax_scale,
             head_scale,
             use_fp4,
+            output_buffers=output_buffers,
         )
+
+    if output_buffers is not None:
+        # Caller-provided buffers are written in place (input-GEMM fusion
+        # hands the kernel slices of a preallocated batch buffer).
+        q_fused_first = q_quant_fused[0] if use_fp4 else q_quant_fused
+        assert q_fused_first.data_ptr() == output_buffers[0].data_ptr()
 
     if use_fp4:
         q_quant_ref, q_scale_ref = q_quant_ref
@@ -230,7 +258,9 @@ def test_fused_indexer_q_rope_quant_matches_unfused(
     )
 
 
-@pytest.mark.skipif(not has_cutedsl(), reason="cutedsl (cutlass) not installed")
+@pytest.mark.skipif(
+    not is_cutedsl_supported(), reason="cutedsl (cutlass) not installed"
+)
 @pytest.mark.parametrize(
     "use_fp4",
     [
@@ -291,16 +321,16 @@ def test_cutedsl_indexer_q_writes_stay_within_num_tokens(use_fp4, n_head):
             dtype=torch.uint8,
             device=device,
         )
-        mod._INDEXER_Q_MXFP4_KERNEL(
-            positions=positions[:num_tokens],
-            q=q[:num_tokens],
-            cos_sin_cache=cos_sin_cache,
-            weights=weights[:num_tokens],
-            weights_softmax_scale=1.0,
-            weights_head_scale=1.0,
-            q_packed=outputs["q_packed"][:num_tokens],
-            q_scale=outputs["q_scale"][:num_tokens],
-            weights_out=weights_out[:num_tokens],
+        mod.fused_indexer_q_rope_quant_mxfp4_cutedsl(
+            positions[:num_tokens],
+            q[:num_tokens],
+            cos_sin_cache,
+            weights[:num_tokens],
+            1.0,
+            1.0,
+            outputs["q_packed"][:num_tokens],
+            outputs["q_scale"][:num_tokens],
+            weights_out[:num_tokens],
         )
     else:
         outputs["q_fp8"] = torch.full(
@@ -309,15 +339,15 @@ def test_cutedsl_indexer_q_writes_stay_within_num_tokens(use_fp4, n_head):
             dtype=torch.uint8,
             device=device,
         )
-        mod._INDEXER_Q_FP8_KERNEL(
-            positions=positions[:num_tokens],
-            q=q[:num_tokens],
-            cos_sin_cache=cos_sin_cache,
-            weights=weights[:num_tokens],
-            weights_softmax_scale=1.0,
-            weights_head_scale=1.0,
-            q_fp8=outputs["q_fp8"][:num_tokens].view(torch.float8_e4m3fn),
-            weights_out=weights_out[:num_tokens],
+        mod.fused_indexer_q_rope_quant_fp8_cutedsl(
+            positions[:num_tokens],
+            q[:num_tokens],
+            cos_sin_cache,
+            weights[:num_tokens],
+            1.0,
+            1.0,
+            outputs["q_fp8"][:num_tokens].view(torch.float8_e4m3fn),
+            weights_out[:num_tokens],
         )
     torch.accelerator.synchronize()
 
@@ -580,7 +610,7 @@ def test_fused_indexer_q_rope_quant_writes_bf16_weights(use_cutedsl):
     """The MXFP4 path can emit the per-head weights in bf16 (what DeepGEMM's
     sparse MQA-logits kernels take) instead of fp32; the values are the fp32
     result rounded once, so the scoring kernel needs no cast."""
-    if use_cutedsl and not has_cutedsl():
+    if use_cutedsl and not is_cutedsl_supported():
         pytest.skip("cutedsl (cutlass) not installed")
 
     device = "cuda"
@@ -599,7 +629,7 @@ def test_fused_indexer_q_rope_quant_writes_bf16_weights(use_cutedsl):
     )
     cutedsl_patch = (
         mock.patch(
-            "vllm.models.deepseek_v4.common.ops.fused_indexer_q.has_cutedsl",
+            "vllm.models.deepseek_v4.common.ops.fused_indexer_q.is_cutedsl_supported",
             return_value=False,
         )
         if not use_cutedsl
