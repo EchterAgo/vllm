@@ -111,13 +111,22 @@ class CPUModelRunner(GPUModelRunner):
     def _sync_device(self) -> None:
         pass
 
-    def _zero_block_ids(self, block_ids: list[int]) -> None:
+    def _zero_block_ids(self, block_ids_per_group: list[list[int]]) -> None:
         # Zero full-attention blocks to prevent stale data corruption on partial writes.
         # Encoder-only (runner-only) layers are not FullAttentionSpec, so the
         # spec filter below already excludes them; no runner-only skip needed.
+        # Block ids are group-scoped: zeroing another group's id would wipe a
+        # live block there (#50576).
         seen_ptrs: set[int] = set()
-        for group in self.kv_cache_config.kv_cache_groups:
+        for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups):
             if not isinstance(group.kv_cache_spec, FullAttentionSpec):
+                continue
+            block_ids = (
+                block_ids_per_group[group_id]
+                if group_id < len(block_ids_per_group)
+                else []
+            )
+            if not block_ids:
                 continue
             for layer_name in group.layer_names:
                 ctx = self.compilation_config.static_forward_context.get(layer_name)

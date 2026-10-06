@@ -871,7 +871,7 @@ def test_hisparse_host_cow_copy_is_drained_without_a_gpu_pool():
     copies = connector.build_connector_meta(output).host_block_copies
     assert output.has_sync_kv_loads
 
-    assert new_blocks and new_block_ids == []
+    assert new_blocks and not any(new_block_ids)
     assert len(copies) == 1
     assert copies[0].src_block_id == source_block.block_id
     assert copies[0].dst_block_id == new_blocks[0].block_id
