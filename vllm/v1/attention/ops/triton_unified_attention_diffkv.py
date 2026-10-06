@@ -22,6 +22,7 @@ Both 2D and 3D launches are supported:
     for decode-only batches whose 2D grid would under-fill the GPU.
 """
 
+import os
 from typing import Any
 
 import torch
@@ -46,12 +47,28 @@ logger = init_logger(__name__)
 
 is_batch_invariant = envs.VLLM_BATCH_INVARIANT
 
-# Whole-verify split-KV grouping: one program covers all q tokens of a
-# spec-decode verify request (BLOCK_M = q_len * GQA group, capped at 128).
-_SPEC_3D_MAX_Q = 16
-_SPEC_3D_BLOCK_M = 128
-_SPEC_3D_NUM_WARPS = 8
-_SPEC_3D_TILE = 16
+# Split-KV spec-decode verify: max query tokens per sequence routed onto the 3D
+# path (0 = off). Their 2D grid under-fills the GPU; the 3D path reads each K/V
+# tile once for all verify tokens instead of once per token.
+_SPEC_3D_MAX_Q = int(os.environ.get("VLLM_DIFFKV_SPEC_3D_MAX_Q", "16"))
+# Prefill-shaped 2D launches (max_seqlen_q >= _PREFILL_MIN_Q) use a larger
+# BLOCK_M (several query tokens per program) so K/V tiles are reused across
+# query rows. VLLM_DIFFKV_PREFILL_BLOCK_M=16 restores the stock BLOCK_M.
+_PREFILL_BLOCK_M = int(os.environ.get("VLLM_DIFFKV_PREFILL_BLOCK_M", "128"))
+_PREFILL_NUM_WARPS = int(os.environ.get("VLLM_DIFFKV_PREFILL_NUM_WARPS", "8"))
+_PREFILL_NUM_STAGES = int(os.environ.get("VLLM_DIFFKV_PREFILL_NUM_STAGES", "2"))
+_PREFILL_TILE = int(os.environ.get("VLLM_DIFFKV_PREFILL_TILE", "32"))
+# fp8 KV on full-attention layers fits tile 64 (fp8 K/V tiles halve smem); SWA
+# layers keep tile 32 (tile 64 + sinks exceeds SM120 smem).
+_PREFILL_TILE_FP8_GLOBAL = int(
+    os.environ.get("VLLM_DIFFKV_PREFILL_TILE_FP8_GLOBAL", "64")
+)
+_PREFILL_MIN_Q = 64
+# The split-KV spec-verify program covers all q tokens of a request in one
+# BLOCK_M (q_len x GQA group, capped). 0 = stock BLOCK_M.
+_SPEC_3D_BLOCK_M = int(os.environ.get("VLLM_DIFFKV_SPEC_3D_BLOCK_M", "128"))
+_SPEC_3D_NUM_WARPS = int(os.environ.get("VLLM_DIFFKV_SPEC_3D_NUM_WARPS", "8"))
+_SPEC_3D_TILE = int(os.environ.get("VLLM_DIFFKV_SPEC_3D_TILE", "16"))
 
 
 @triton.jit
@@ -452,6 +469,17 @@ def unified_attention_diffkv(
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
     )
     launch_kw: dict[str, int] = {}
+    prefill_tile = None
+    if (
+        max_seqlen_q >= _PREFILL_MIN_Q
+        and _PREFILL_BLOCK_M > BLOCK_M
+        and _PREFILL_BLOCK_M % num_queries_per_kv == 0
+    ):
+        BLOCK_M = _PREFILL_BLOCK_M
+        launch_kw["num_warps"] = _PREFILL_NUM_WARPS
+        if _PREFILL_NUM_STAGES > 0:
+            launch_kw["num_stages"] = _PREFILL_NUM_STAGES
+        prefill_tile = _PREFILL_TILE
 
     sliding_window_val = 1 + window_size[0] if window_size[0] >= 0 else 0
 
@@ -498,6 +526,10 @@ def unified_attention_diffkv(
     tile_size = 32 if not use_3d else (16 if q.element_size() >= 2 else 32)
     if spec_tile is not None:
         tile_size = spec_tile
+    if prefill_tile is not None and not use_3d:
+        tile_size = prefill_tile
+        if k.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+            tile_size = _PREFILL_TILE_FP8_GLOBAL
 
     grid: tuple[Any, ...]
     if use_3d:
