@@ -3,7 +3,7 @@
 import torch
 import torch.nn as nn
 
-from vllm.config import VllmConfig, replace
+from vllm.config import CompilationMode, VllmConfig, replace
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.lora.layers.base import BaseLayerWithLoRA
 from vllm.model_executor.layers.quantization.online.lm_head import (
@@ -89,10 +89,24 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
     )
     if draft_load_config is not vllm_config.load_config:
         vllm_config = replace(vllm_config, load_config=draft_load_config)
-    with set_model_tag("eagle_head"):
-        eagle_model = get_model(
-            vllm_config=vllm_config, model_config=draft_model_config
-        )
+    # enforce_eager on the speculative config must make the DRAFT eager too;
+    # otherwise the draft inherits the target's VLLM_COMPILE mode (dynamo
+    # fails on data-dependent asserts in some MTP heads, and concurrent
+    # draft+target AOT compiles race in TritonBundler's cache). Mutate the
+    # mode in place rather than replace(): the draft's attention layers
+    # register into this compilation_config's static_forward_context, which
+    # the runtime forward context looks up on the original object.
+    compilation_config = vllm_config.compilation_config
+    original_mode = compilation_config.mode
+    if speculative_config.enforce_eager:
+        compilation_config.mode = CompilationMode.NONE
+    try:
+        with set_model_tag("eagle_head"):
+            eagle_model = get_model(
+                vllm_config=vllm_config, model_config=draft_model_config
+            )
+    finally:
+        compilation_config.mode = original_mode
 
     target_language_model = (
         target_model.get_language_model()

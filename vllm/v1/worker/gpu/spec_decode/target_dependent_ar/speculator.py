@@ -488,6 +488,17 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
             self.hidden_states[:num_reqs] = hidden_states[last_token_indices]
         self.input_buffers.positions[:num_reqs] = positions
         self.sample_src_positions[:num_reqs] = sample_src_positions
+        self._fence_draft_inputs()
+
+    def _fence_draft_inputs(self) -> None:
+        """Fence the draft input-buffer writes before the next step consumes
+        them (vllm-project/vllm#40756: the MTP illegal-memory-access family was
+        traced to these writes racing the next step's copies on other streams;
+        a current-stream synchronize eliminates it on SM86-SM121). Skipped under
+        graph capture, where synchronize is illegal and replay order is fixed
+        by the capture-time stream dependencies."""
+        if not torch.cuda.is_current_stream_capturing():
+            torch.accelerator.current_stream().synchronize()
 
     def _multi_step_decode(
         self,
@@ -680,6 +691,7 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
             num_speculative_steps,
             advance_draft_positions=self.advance_draft_positions,
         )
+        self._fence_draft_inputs()
 
 
 @triton.jit
