@@ -10,20 +10,25 @@ import torch
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
 
+# These Triton kernels are also the CUDA SM8x (Ampere) sparse-MLA path, not
+# just ROCm's -- see vllm/models/deepseek_v4/ampere/ampere_sparse.py.
 pytestmark = pytest.mark.skipif(
-    not current_platform.is_rocm(), reason="Only used by ROCm"
+    not (
+        current_platform.is_rocm()
+        or (
+            current_platform.is_cuda()
+            and not current_platform.has_device_capability(90)
+        )
+    ),
+    reason="ROCm or pre-Hopper CUDA only",
 )
 
 
 def _on_split_decode_arch() -> bool:
-    if not current_platform.is_rocm():
-        return False
-    try:
-        from vllm.platforms.rocm import _ON_GFX942, _ON_GFX950
+    """Mirrors _use_split_k_decode(): CUDA plus the tuned gfx9 arches."""
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import _use_split_k_decode
 
-        return bool(_ON_GFX942 or _ON_GFX950)
-    except Exception:
-        return False
+    return _use_split_k_decode()
 
 
 def _on_gfx950() -> bool:
@@ -41,7 +46,7 @@ def _on_gfx950() -> bool:
 # architectures take the fallback decode kernel, so its tests are skipped there.
 requires_split_decode_arch = pytest.mark.skipif(
     not _on_split_decode_arch(),
-    reason="split-K decode and the V4.1 combine tests need an AMD gfx942/gfx950",
+    reason="split-K decode path not selected on this arch",
 )
 requires_gfx950 = pytest.mark.skipif(
     not _on_gfx950(),
@@ -2487,6 +2492,349 @@ def test_get_cached_wo_a_bf16_fp8_blockscale_caches() -> None:
 
     # Second call returns the same cached object.
     assert _get_cached_wo_a_bf16(wo_a, n_local_groups, o_lora_rank, hidden_dim) is out
+
+
+def test_sparse_attn_decode_int32_block_address_overflow() -> None:
+    """Block ids past 2^31 / stride must not wrap the cache addressing.
+
+    stride0 = 64 * 584 = 37376 B, so ids >= ~57.5k overflow int32. Only the
+    tail blocks are populated; a wrapped address reads zeros or faults.
+    """
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+        _rocm_sparse_attn_decode_ragged_triton,
+    )
+
+    torch.manual_seed(3)
+    use_fnuz = current_platform.is_fp8_fnuz()
+    num_blocks, block_size = 58000, 64
+    n_fill, num_q, num_heads = 128, 2, 4
+    base_slot = (num_blocks - 2) * block_size
+
+    # Populate only the last two blocks, addressed past the int32 boundary.
+    kv = torch.zeros(base_slot + n_fill, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    kv[base_slot:] = torch.randn(n_fill, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    cache = _pack_fp8_ds_mla_cache(kv, block_size, use_fnuz=use_fnuz)
+
+    q = torch.randn(num_q, num_heads, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    rows = [
+        (base_slot + torch.randint(0, n_fill, (64,))).tolist() for _ in range(num_q)
+    ]
+    indices, indptr = _ragged_from_rows(rows, q.device)
+    scale = HEAD_DIM**-0.5
+
+    actual = _rocm_sparse_attn_decode_ragged_triton(
+        q=q,
+        main_cache=cache,
+        main_indices=indices,
+        main_indptr=indptr,
+        scale=scale,
+        attn_sink=None,
+        nope_head_dim=NOPE_HEAD_DIM,
+        rope_head_dim=ROPE_HEAD_DIM,
+    )
+    assert actual.isfinite().all()
+
+    expected = _ref_sparse_decode_ragged(
+        q,
+        cache,
+        rows,
+        scale,
+        None,
+        block_size,
+        main_use_fnuz=use_fnuz,
+    )
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize(
+    "num_rows",
+    # 8191/8192/8193 straddle the one-block cap. 8192 is the production shape
+    # (an 8K prefill), and it sat one row *past* the old cap, so every prefill
+    # layer took the torch fallback -- see the cap's comment.
+    [0, 1, 6, 7, 48, 129, 1024, 4096, 8191, 8192, 8193],
+)
+@torch.inference_mode()
+def test_lengths_to_indptr_matches_torch_cumsum(num_rows: int) -> None:
+    """The one-launch exclusive scan must be bit-identical to zeros+cumsum."""
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import lengths_to_indptr
+
+    device = torch.device("cuda")
+    torch.manual_seed(num_rows)
+    lengths = torch.randint(0, 513, (num_rows,), dtype=torch.int32, device=device)
+
+    expected = torch.zeros(num_rows + 1, dtype=torch.int32, device=device)
+    torch.cumsum(lengths, dim=0, out=expected[1:])
+
+    actual = lengths_to_indptr(lengths)
+    assert actual.dtype == torch.int32
+    assert actual.shape == (num_rows + 1,)
+    assert torch.equal(actual, expected)
+
+
+@torch.inference_mode()
+def test_lengths_to_indptr_stays_one_block_at_prefill_width() -> None:
+    """An 8192-row prefill must NOT take the torch fallback.
+
+    The fallback opens with a pageable H2D (`indptr[0] = 0`) that blocks the
+    host, which measured ~5.7 ms of GPU idle per 8K prefill when the cap sat at
+    8191 and every layer fell through. Asserting the cap covers 8192 is not
+    enough on its own -- a future kernel change could raise the cap while
+    breaking the one-block path -- so this makes the fallback unavailable and
+    checks the result is still correct.
+    """
+    import vllm.envs as envs
+    from vllm.v1.attention.ops import rocm_aiter_mla_sparse as ops
+
+    if not envs.VLLM_SPARSE_RAGGED_FAST_SCAN:
+        pytest.skip(
+            "VLLM_SPARSE_RAGGED_FAST_SCAN=0 selects the legacy 8191 cap on "
+            "purpose; that arm exists to be measured against, not to pass this"
+        )
+
+    device = torch.device("cuda")
+    num_rows = 8192
+    assert num_rows <= ops._MAX_ONE_BLOCK_INDPTR_ROWS, (
+        "the one-block cap no longer covers the 8K prefill shape; every "
+        "prefill layer will take the pageable-H2D fallback"
+    )
+    lengths = torch.randint(0, 641, (num_rows,), dtype=torch.int32, device=device)
+    expected = torch.zeros(num_rows + 1, dtype=torch.int32, device=device)
+    torch.cumsum(lengths, dim=0, out=expected[1:])
+
+    def _no_fallback(*args, **kwargs):
+        raise AssertionError("torch.cumsum fallback taken at the prefill width")
+
+    real_cumsum = torch.cumsum
+    torch.cumsum = _no_fallback  # type: ignore[assignment]
+    try:
+        actual = ops.lengths_to_indptr(lengths)
+    finally:
+        torch.cumsum = real_cumsum  # type: ignore[assignment]
+    assert torch.equal(actual, expected)
+
+
+@torch.inference_mode()
+def test_lengths_to_indptr_falls_back_above_one_block() -> None:
+    """Row counts past the single-block cap still produce the same indptr."""
+    from vllm.v1.attention.ops import rocm_aiter_mla_sparse as ops
+
+    device = torch.device("cuda")
+    num_rows = ops._MAX_ONE_BLOCK_INDPTR_ROWS + 5
+    lengths = torch.randint(0, 17, (num_rows,), dtype=torch.int32, device=device)
+
+    expected = torch.zeros(num_rows + 1, dtype=torch.int32, device=device)
+    torch.cumsum(lengths, dim=0, out=expected[1:])
+
+    assert torch.equal(ops.lengths_to_indptr(lengths), expected)
+
+
+@torch.inference_mode()
+def test_lengths_to_indptr_accepts_noncontiguous_int64() -> None:
+    """Callers pass strided / int64 lengths; the kernel must normalize them."""
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import lengths_to_indptr
+
+    device = torch.device("cuda")
+    strided = torch.arange(0, 32, dtype=torch.int64, device=device).reshape(16, 2)[:, 0]
+    assert not strided.is_contiguous()
+
+    expected = torch.zeros(17, dtype=torch.int32, device=device)
+    torch.cumsum(strided.to(torch.int32), dim=0, out=expected[1:])
+
+    assert torch.equal(lengths_to_indptr(strided), expected)
+
+
+def _decode_case(num_q: int = 6, num_heads: int = 4, seed: int = 11):
+    """A small ragged decode setup shared by the in-place output tests."""
+    torch.manual_seed(seed)
+    use_fnuz = current_platform.is_fp8_fnuz()
+    block_size, n_slots = 16, 64
+    kv = torch.randn(n_slots, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    cache = _pack_fp8_ds_mla_cache(kv, block_size, use_fnuz=use_fnuz)
+    q = torch.randn(num_q, num_heads, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    rows = [torch.randperm(n_slots)[: 3 + i % 5].tolist() for i in range(num_q)]
+    indices, indptr = _ragged_from_rows(rows, q.device)
+    return q, cache, indices, indptr
+
+
+@torch.inference_mode()
+def test_sparse_attn_decode_writes_caller_out_bit_exactly() -> None:
+    """`out=` must produce byte-identical results to the allocate-then-copy path."""
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+        _rocm_sparse_attn_decode_ragged_triton,
+    )
+
+    q, cache, indices, indptr = _decode_case()
+    kwargs = dict(
+        q=q,
+        main_cache=cache,
+        main_indices=indices,
+        main_indptr=indptr,
+        scale=HEAD_DIM**-0.5,
+        attn_sink=None,
+        nope_head_dim=NOPE_HEAD_DIM,
+        rope_head_dim=ROPE_HEAD_DIM,
+    )
+    allocated = _rocm_sparse_attn_decode_ragged_triton(**kwargs)
+
+    provided = torch.full_like(allocated, float("nan"))
+    returned = _rocm_sparse_attn_decode_ragged_triton(**kwargs, out=provided)
+
+    assert returned.data_ptr() == provided.data_ptr()
+    assert torch.equal(provided, allocated)
+
+
+@torch.inference_mode()
+def test_sparse_attn_decode_out_rejects_wrong_layout() -> None:
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+        _rocm_sparse_attn_decode_ragged_triton,
+    )
+
+    q, cache, indices, indptr = _decode_case()
+    kwargs = dict(
+        q=q,
+        main_cache=cache,
+        main_indices=indices,
+        main_indptr=indptr,
+        scale=HEAD_DIM**-0.5,
+        attn_sink=None,
+        nope_head_dim=NOPE_HEAD_DIM,
+        rope_head_dim=ROPE_HEAD_DIM,
+    )
+    with pytest.raises(AssertionError):
+        _rocm_sparse_attn_decode_ragged_triton(
+            **kwargs, out=torch.empty_like(q, dtype=torch.float32)
+        )
+    transposed = torch.empty(
+        (q.shape[0], q.shape[2], q.shape[1]), dtype=torch.bfloat16, device=q.device
+    ).transpose(1, 2)
+    with pytest.raises(AssertionError):
+        _rocm_sparse_attn_decode_ragged_triton(**kwargs, out=transposed)
+
+
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
+@torch.inference_mode()
+def test_rocm_sparse_attn_decode_output_matches_across_paths(out_dtype) -> None:
+    """bf16 takes the in-place route, fp32 keeps the temp + copy; same values."""
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+        _rocm_sparse_attn_decode_ragged_triton,
+        rocm_sparse_attn_decode,
+    )
+
+    q, cache, indices, indptr = _decode_case()
+    lens = (indptr[1:] - indptr[:-1]).to(torch.int32)
+    reference = _rocm_sparse_attn_decode_ragged_triton(
+        q=q,
+        main_cache=cache,
+        main_indices=indices,
+        main_indptr=indptr,
+        scale=HEAD_DIM**-0.5,
+        attn_sink=None,
+        nope_head_dim=NOPE_HEAD_DIM,
+        rope_head_dim=ROPE_HEAD_DIM,
+    )
+
+    output = torch.full(q.shape, float("nan"), dtype=out_dtype, device=q.device)
+    rocm_sparse_attn_decode(
+        q=q,
+        kv_cache=None,
+        swa_k_cache=cache,
+        swa_only=True,
+        topk_indices=None,
+        topk_lens=None,
+        swa_indices=torch.zeros((q.shape[0], 1), dtype=torch.int32, device=q.device),
+        swa_lens=lens,
+        swa_ragged_indices=indices,
+        swa_ragged_indptr=indptr,
+        topk_ragged_indices=None,
+        topk_ragged_indptr=None,
+        attn_sink=None,
+        scale=HEAD_DIM**-0.5,
+        head_dim=HEAD_DIM,
+        nope_head_dim=NOPE_HEAD_DIM,
+        rope_head_dim=ROPE_HEAD_DIM,
+        output=output,
+    )
+    assert torch.equal(output, reference.to(out_dtype))
+
+
+@pytest.mark.parametrize("num_rows", [1, 6, 48])
+@torch.inference_mode()
+def test_build_ragged_into_caller_buffers_matches_allocating_form(num_rows) -> None:
+    """Writing into caller buffers must reproduce the allocate-then-copy result."""
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+        build_ragged_indices_from_dense,
+    )
+
+    device = torch.device("cuda")
+    torch.manual_seed(num_rows)
+    width = 24
+    dense = torch.randint(0, 400, (num_rows, width), dtype=torch.int32, device=device)
+    lengths = torch.randint(0, width + 1, (num_rows,), dtype=torch.int32, device=device)
+
+    want_flat, want_indptr = build_ragged_indices_from_dense(dense, lengths)
+
+    # Deliberately oversized, as the graph buffers are.
+    flat_buf = torch.full(
+        (num_rows * width + 37,), -777, dtype=torch.int32, device=device
+    )
+    indptr_buf = torch.full((num_rows + 9,), -777, dtype=torch.int32, device=device)
+    got_flat, got_indptr = build_ragged_indices_from_dense(
+        dense,
+        lengths,
+        indices_out=flat_buf,
+        indptr_out=indptr_buf[: num_rows + 1],
+    )
+
+    assert got_indptr.data_ptr() == indptr_buf.data_ptr()
+    assert got_flat.data_ptr() == flat_buf.data_ptr()
+    assert torch.equal(got_indptr, want_indptr)
+    nnz = int(want_indptr[-1])
+    assert torch.equal(got_flat[:nnz], want_flat[:nnz])
+    # Nothing past the buffer's used region may be touched.
+    assert torch.equal(
+        indptr_buf[num_rows + 1 :],
+        torch.full((8,), -777, dtype=torch.int32, device=device),
+    )
+
+
+@torch.inference_mode()
+def test_build_ragged_into_graph_buffers_returns_stable_views() -> None:
+    """The metadata builder helper must hand back views of the graph buffers."""
+    from vllm.models.deepseek_v4.amd.rocm import _build_ragged_into_graph_buffers
+
+    device = torch.device("cuda")
+    torch.manual_seed(5)
+    num_rows, width = 6, 16
+    dense = torch.randint(0, 200, (num_rows, width), dtype=torch.int32, device=device)
+    lengths = torch.randint(0, width + 1, (num_rows,), dtype=torch.int32, device=device)
+
+    indices_buf = torch.empty(num_rows * width, dtype=torch.int32, device=device)
+    indptr_buf = torch.empty(num_rows + 1, dtype=torch.int32, device=device)
+    ragged, indptr = _build_ragged_into_graph_buffers(
+        dense, lengths, indices_buf, indptr_buf, num_rows, width
+    )
+
+    assert ragged.data_ptr() == indices_buf.data_ptr()
+    assert indptr.data_ptr() == indptr_buf.data_ptr()
+    assert indptr.shape == (num_rows + 1,)
+    expected_lens = lengths.clamp(min=0, max=width)
+    assert torch.equal(indptr[1:] - indptr[:-1], expected_lens)
+    for row in range(num_rows):
+        start, end = int(indptr[row]), int(indptr[row + 1])
+        assert torch.equal(ragged[start:end], dense[row, : end - start])
+
+
+@torch.inference_mode()
+def test_lengths_to_indptr_rejects_strided_out() -> None:
+    """A strided `out` would be written at the wrong addresses, not error."""
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import lengths_to_indptr
+
+    device = torch.device("cuda")
+    lengths = torch.ones(6, dtype=torch.int32, device=device)
+    strided = torch.zeros(14, dtype=torch.int32, device=device)[::2]
+    assert strided.shape == (7,) and not strided.is_contiguous()
+    with pytest.raises(AssertionError):
+        lengths_to_indptr(lengths, out=strided)
 
 
 @requires_split_decode_arch
