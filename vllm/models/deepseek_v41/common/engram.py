@@ -77,6 +77,7 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.platform_utils import is_uva_available
 from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+from vllm.v1.attention.ops.fp8_sm80 import _decode_fp8_f32
 
 logger = init_logger(__name__)
 
@@ -662,9 +663,10 @@ def _engram_lookup_kernel(
     """Gather FP8 rows as packed values/scales or dequantized BF16.
 
     Only this rank's heads are read; padded heads write zeros for all-gather.
-    `weight`/`scales` may address pinned host memory through UVA. If SORTED,
-    `ids` holds rows relative to vocab_start in table order and `sorted_dst`
-    their output rows.
+    `weight`/`scales` may address pinned host memory through UVA. `weight` is
+    the uint8 view of the e4m3 rows so the decode also compiles below SM89. If
+    SORTED, `ids` holds rows relative to vocab_start in table order and
+    `sorted_dst` their output rows.
     """
     cols = tl.arange(0, DIM)
     scale_cols = cols // QUANT_BLOCK
@@ -691,7 +693,7 @@ def _engram_lookup_kernel(
         values = tl.load(
             weight + local[:, None] * DIM + cols[None, :],
             mask=owned[:, None],
-            other=0.0,
+            other=0,
         )
         scale = tl.load(
             scales + local[:, None] * (DIM // QUANT_BLOCK) + scale_cols[None, :],
@@ -713,11 +715,14 @@ def _engram_lookup_kernel(
                 mask=valid[:, None] & (cols[None, :] % QUANT_BLOCK == 0),
             )
         else:
+            # `weight` is the uint8 view of the e4m3 rows so this decode also
+            # compiles below SM89.
+            values = _decode_fp8_f32(values, False)
             # ue8m0 is a power of two, so its byte *is* the fp32 exponent field.
             scale = (scale.to(tl.int32) << 23).to(tl.float32, bitcast=True)
             tl.store(
                 out + dst[:, None] * DIM + cols[None, :],
-                (values.to(tl.float32) * scale).to(tl.bfloat16),
+                (values * scale).to(tl.bfloat16),
                 mask=valid[:, None],
             )
 
@@ -1145,7 +1150,7 @@ class ParallelEngramEmbedding(nn.Module):
         tiles = triton.cdiv(rows, 16)
         grid = min(tiles, self._num_sms // 2 if background else self._num_sms)
         _engram_lookup_kernel[(grid,)](
-            weight,
+            weight.view(torch.uint8),
             scales,
             indices,
             dst,
