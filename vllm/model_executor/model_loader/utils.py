@@ -34,6 +34,7 @@ from vllm.model_executor.model_loader.weight_cache.utils import (
 )
 from vllm.model_executor.model_loader.weight_tying import maybe_retie_word_embeddings
 from vllm.model_executor.models.interfaces import SupportsQuant
+from vllm.model_executor.offloader.base import pin_exact, release_pinned
 from vllm.model_executor.utils import is_weights_pre_processed
 from vllm.tracing import instrument
 from vllm.utils.mem_utils import release_device_memory_under_pressure
@@ -223,7 +224,9 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
         return
 
     cpu_params: set[str] = set()
-    uva_offloaded_parameters: list[str] = []
+    # name -> data_ptr of the pinned host mapping backing the UVA view, so a
+    # re-offload after post-processing can release the first mapping.
+    uva_offloaded_parameters: dict[str, int] = {}
 
     # Store which parameters are on CPU and move them to the GPU
     for name, p in module.named_parameters():
@@ -231,7 +234,7 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
             cpu_params.add(name)
             p.data = p.data.to(target_device)
         if getattr(p, "_vllm_is_uva_offloaded", False):
-            uva_offloaded_parameters.append(name)
+            uva_offloaded_parameters[name] = p.data.data_ptr()
         # Parameters already on target device are not touched
 
     try:
@@ -254,9 +257,15 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
             if name in uva_offloaded_parameters and not getattr(
                 p, "_vllm_is_uva_offloaded", False
             ):
-                cpu_data = torch.empty_like(
-                    p.data, device="cpu", pin_memory=use_pin_memory
-                ).copy_(p.data)
+                # The parameter is being re-offloaded after post-processing
+                # replaced it (e.g. a Marlin repack). Pin at exact size again
+                # (see offloader.base.pin_exact) and release the mapping the
+                # first offload created, or both copies stay resident.
+                if use_pin_memory:
+                    cpu_data = pin_exact(p.data.to(device="cpu"))
+                    release_pinned(uva_offloaded_parameters[name])
+                else:
+                    cpu_data = torch.empty_like(p.data, device="cpu").copy_(p.data)
                 p.data = get_accelerator_view_from_cpu_tensor(cpu_data)
                 p._vllm_is_uva_offloaded = True
 
