@@ -685,6 +685,30 @@ RUN if [ "$RUN_WHEEL_CHECK" = "true" ] && \
 
 #################### WHEEL BUILD IMAGE ####################
 
+#################### LMCACHE BUILD IMAGE ####################
+# Build the wtdcode/LMCache fork wheel against this image's torch. Kept as its
+# own stage so bumping LMCACHE_REF only recompiles LMCache (~minutes), and the
+# runtime stages (which have no nvcc) just install the wheel.
+FROM build AS lmcache-build
+ARG LMCACHE_REPO=https://github.com/wtdcode/LMCache.git
+ARG LMCACHE_REF=2acb7b24bea5ac55c5dfc6a41366099236ec525c
+# Do not add +PTX here; see the main TORCH_CUDA_ARCH_LIST comment above.
+ARG torch_cuda_arch_list
+ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
+ARG max_jobs=16
+ENV MAX_JOBS=${max_jobs}
+ARG nvcc_threads
+ENV NVCC_THREADS=$nvcc_threads
+
+RUN --mount=type=cache,target=/opt/uv/cache \
+    git clone ${LMCACHE_REPO} /workspace/lmcache-src \
+    && cd /workspace/lmcache-src \
+    && git checkout ${LMCACHE_REF} \
+    && uv pip install --python /opt/venv/bin/python3 pip -r requirements/build.txt \
+    && CUDA_HOME=/usr/local/cuda /opt/venv/bin/python3 -m pip wheel . \
+        --no-build-isolation --no-deps -w /workspace/lmcache-dist \
+    && ls /workspace/lmcache-dist
+
 #################### DEV IMAGE ####################
 FROM base AS dev
 
@@ -1241,6 +1265,19 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         fi; \
         rm -f /tmp/kv-installed.txt /tmp/kv-constraints.txt; \
     fi
+
+# LMCache (wtdcode fork) built in the lmcache-build stage; the runtime base has
+# no nvcc so only the prebuilt wheel is installed here. Runtime deps come from
+# PyPI; torch is deliberately left as the image's own build.
+ARG INSTALL_LMCACHE=false
+COPY --from=lmcache-build /workspace/lmcache-dist /tmp/lmcache-dist
+RUN --mount=type=cache,target=/opt/uv/cache \
+    if [ "$INSTALL_LMCACHE" = "true" ]; then \
+        uv pip install --system /tmp/lmcache-dist/*.whl \
+        && python3 -c "import lmcache" \
+        && lmcache --help > /dev/null; \
+    fi; \
+    rm -rf /tmp/lmcache-dist
 
 # Mooncake registers GPU memory for RDMA via nvidia-peermem by default. Hosts
 # without that module loaded (e.g. GB200) must pass WITH_NVIDIA_PEERMEM=0 at run
