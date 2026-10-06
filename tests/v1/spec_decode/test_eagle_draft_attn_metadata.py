@@ -128,6 +128,30 @@ def test_build_draft_attn_metadata_sets_seq_lens_cpu_upper_bound():
     assert torch.equal(bound, torch.tensor([102, 202, 302, 0], dtype=torch.int32))
 
 
+def test_build_draft_attn_metadata_sets_positions():
+    """Builders with position-derived slot mappings (e.g. the kpool tail
+    ring buffer) read ``positions`` off the per-step metadata."""
+    fake = _make_fake_speculator()
+
+    captured = _run_build(
+        fake,
+        num_reqs=3,
+        num_reqs_padded=4,
+        base=torch.tensor([100, 200, 300, 0], dtype=torch.int32),
+        step=2,
+    )
+
+    positions = captured["positions"]
+    assert isinstance(positions, torch.Tensor)
+    # A FULL graph pads to the whole captured token budget (one token per
+    # padded request here), so the builder sees the padded width.
+    assert torch.equal(positions, fake.input_buffers.positions[:4])
+
+
+def test_build_draft_attn_metadata_handles_zero_unpadded_reqs():
+    """Edge case: when ``num_reqs == 0`` the upper-bound tensor must
+    still be a valid all-zero tensor of length ``num_reqs_padded``."""
+
 def test_build_draft_attn_metadata_zeroes_padded_upper_bound_tail():
     """The padded tail of the upper-bound tensor is zeroed, so it stays a
     valid tensor of length ``num_reqs_padded`` regardless of padding."""
