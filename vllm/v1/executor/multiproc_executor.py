@@ -431,21 +431,45 @@ class MultiprocExecutor(Executor):
             response_mqs = (response_mqs[output_rank],)
 
         def get_response():
-            responses = []
-            for mq in response_mqs:
-                dequeue_timeout = (
-                    None if deadline is None else max(0.0, deadline - time.monotonic())
-                )
-                try:
-                    status, result = mq.dequeue(timeout=dequeue_timeout)
-                except TimeoutError as e:
-                    raise TimeoutError(f"RPC call to {method} timed out.") from e
-                if status != WorkerProc.ResponseStatus.SUCCESS:
+            # Collect one response per queue, but never commit to an
+            # indefinite blocking wait on a single rank. Failure modes this
+            # must survive (all observed in production):
+            #  - rank k fails and enqueues an error response while rank 0 is
+            #    stuck in a collective that rank k will never join: a
+            #    sequential blocking scan wedges on rank 0's queue forever
+            #    with rank k's failure sitting unread. -> scan all queues in
+            #    short slices and surface the FIRST failure seen.
+            #  - a non-reply rank dies without ever enqueuing a response
+            #    (with output_rank set, only one rank replies at all): the
+            #    worker monitor notices the process death and flags
+            #    is_failed. -> check it between slices and abort.
+            responses: list[Any] = [None] * len(response_mqs)
+            pending = dict(enumerate(response_mqs))
+            while pending:
+                for idx, mq in list(pending.items()):
+                    slice_timeout = 1.0
+                    if deadline is not None:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0.0:
+                            raise TimeoutError(f"RPC call to {method} timed out.")
+                        slice_timeout = min(slice_timeout, remaining)
+                    try:
+                        status, result = mq.dequeue(timeout=slice_timeout)
+                    except TimeoutError:
+                        continue
+                    if status != WorkerProc.ResponseStatus.SUCCESS:
+                        raise RuntimeError(
+                            f"Worker failed with error '{result}', please check the"
+                            " stack trace above for the root cause"
+                        )
+                    responses[idx] = result
+                    del pending[idx]
+                if pending and self.is_failed:
                     raise RuntimeError(
-                        f"Worker failed with error '{result}', please check the"
-                        " stack trace above for the root cause"
+                        f"RPC call to {method} aborted: a worker process died "
+                        "before responding (see worker logs above for the root "
+                        "cause)"
                     )
-                responses.append(result)
             return responses[0] if output_rank is not None else responses
 
         future = FutureWrapper(
@@ -621,7 +645,9 @@ class WorkerProc:
             )
 
             # Initializes a message queue for sending the model output
-            self.worker_response_mq = MessageQueue(1, 1)
+            self.worker_response_mq = MessageQueue(
+                1, 1, max_chunk_bytes=envs.VLLM_MQ_MAX_CHUNK_BYTES_MB * 1024 * 1024
+            )
             self.peer_response_handles = []
         else:
             # Initialize remote MessageQueue for receiving SchedulerOutput across nodes
@@ -1065,6 +1091,27 @@ class WorkerProc:
             # containing its string representation before transport.
             if output_rank is None or self.rank == output_rank:
                 self.handle_output(e)
+            if isinstance(e, torch.AcceleratorError):
+                # A device-level failure leaves this worker useless while
+                # its siblings keep spinning in collectives this rank
+                # will never join. Staying in the busy loop deadlocks the
+                # whole engine: the executor blocks on a healthy-looking
+                # rank's response queue, nobody exits, and the container
+                # never restarts. Die instead - the executor's worker
+                # monitor sees the process death, terminates all workers
+                # and fails the engine so the container can exit and the
+                # restart policy can self-heal.
+                logger.error(
+                    "WorkerProc exiting after fatal accelerator error "
+                    "(fail-fast so the engine can shut down and restart)."
+                )
+                # Give the executor a moment to drain the failure
+                # response enqueued above before this process vanishes.
+                time.sleep(1.0)
+                # Skip interpreter/CUDA teardown: it can hang for minutes
+                # on a poisoned context, which is exactly the wedge this
+                # exit exists to avoid.
+                os._exit(1)
 
     @staticmethod
     def setup_proc_title_and_log_prefix(enable_ep: bool) -> None:

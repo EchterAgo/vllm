@@ -1132,10 +1132,10 @@ class GPUModelRunner(
             num_blocks=self.kv_cache_config.num_blocks,
         )
 
-    def _zero_block_ids(self, block_ids: list[int]) -> None:
-        """Zero the KV cache memory for the given block IDs."""
+    def _zero_block_ids(self, block_ids_per_group: list[list[int]]) -> None:
+        """Zero the KV cache memory for the given per-group block IDs."""
         if hasattr(self, "_kv_block_zeroer"):
-            self._kv_block_zeroer.zero_block_ids(block_ids)
+            self._kv_block_zeroer.zero_block_ids(block_ids_per_group)
 
     # Note: used for model runner override.
     def _sync_device(self) -> None:
