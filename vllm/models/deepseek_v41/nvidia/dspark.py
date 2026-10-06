@@ -344,6 +344,20 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         # Full-vocab draft: base logits, no d2t scatter.
         return self.compute_logits(hidden_states)
 
+    def compute_draft_logits_shard(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Same logits, this rank's vocab columns only (no gather). The norm is
+        # part of the head, so it stays on this side of the split.
+        return self.logits_processor.get_shard_logits(
+            self.lm_head, self.model.norm(hidden_states)
+        )
+
+    def select_draft_token_shard(
+        self, markov_embed: torch.Tensor, base_shard_logits: torch.Tensor
+    ) -> torch.Tensor:
+        return self.model.markov_head.select_top_tokens(
+            markov_embed, base_shard_logits, self.logits_processor
+        )
+
     def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
         return draft_ids  # full-vocab: draft ids are target ids
 
@@ -359,6 +373,11 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         """Per-position acceptance probability for each drafted token."""
         assert self.model.confidence_head is not None
         return torch.sigmoid(self.model.confidence_head(head_hidden, markov_embed))
+
+    def markov_fusion_operands(self):
+        # The checkpoint's markov_head.embed/head load as markov_w1/markov_w2
+        # (see _remap_dspark_name), so the shared head exposes the operands.
+        return self.model.markov_head.fusion_operands(self.logits_processor)
 
     # --- Weight loading ----------------------------------------------------
 
