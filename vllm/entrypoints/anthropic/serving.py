@@ -13,6 +13,7 @@ from collections.abc import AsyncGenerator
 from typing import Any, Literal, get_args
 
 import jinja2
+import pydantic
 from fastapi import Request
 
 from vllm.engine.protocol import EngineClient
@@ -595,17 +596,40 @@ class AnthropicServingMessages(OpenAIServingChat):
             )
 
     @classmethod
+    def _resolve_chat_template_kwargs(
+        cls,
+        anthropic_request: AnthropicMessagesRequest | AnthropicCountTokensRequest,
+    ) -> dict[str, Any]:
+        """Merge the Anthropic ``thinking`` config into chat template kwargs.
+
+        Anthropic semantics: extended thinking is off unless the request
+        carries ``thinking: {"type": "enabled"}``. Without this mapping the
+        field is silently dropped and the template falls back to its own
+        default (thinking mode since the 0731 contract), putting every
+        /v1/messages session in a mode the client never asked for.
+        Explicit client-provided template kwargs win.
+        """
+        kwargs = dict(anthropic_request.chat_template_kwargs or {})
+        if "thinking" not in kwargs and "enable_thinking" not in kwargs:
+            kwargs["thinking"] = (
+                anthropic_request.thinking is not None
+                and anthropic_request.thinking.type != "disabled"
+            )
+        return kwargs
+
+    @classmethod
     def _build_base_request(
         cls,
         anthropic_request: AnthropicMessagesRequest | AnthropicCountTokensRequest,
         openai_messages: list[dict[str, Any]],
     ) -> ChatCompletionRequest:
         """Build base ChatCompletionRequest."""
+        chat_template_kwargs = cls._resolve_chat_template_kwargs(anthropic_request)
         if isinstance(anthropic_request, AnthropicCountTokensRequest):
             return ChatCompletionRequest(
                 model=anthropic_request.model,
                 messages=openai_messages,
-                chat_template_kwargs=anthropic_request.chat_template_kwargs,
+                chat_template_kwargs=chat_template_kwargs,
             )
 
         return ChatCompletionRequest(
@@ -622,7 +646,7 @@ class AnthropicServingMessages(OpenAIServingChat):
             kv_transfer_params=anthropic_request.kv_transfer_params,
             ec_transfer_params=anthropic_request.ec_transfer_params,
             vllm_xargs=anthropic_request.vllm_xargs,
-            chat_template_kwargs=anthropic_request.chat_template_kwargs,
+            chat_template_kwargs=chat_template_kwargs,
         )
 
     @classmethod
@@ -1005,9 +1029,35 @@ class AnthropicServingMessages(OpenAIServingChat):
                         )
                         yield wrap_data_with_event(data, "message_stop")
                     else:
-                        origin_chunk = ChatCompletionStreamResponse.model_validate_json(
-                            data_str
-                        )
+                        try:
+                            origin_chunk = (
+                                ChatCompletionStreamResponse.model_validate_json(
+                                    data_str
+                                )
+                            )
+                        except pydantic.ValidationError:
+                            # The chat stream emits a bare {"error": ...} payload
+                            # when the request fails mid-stream (e.g. a chat
+                            # template rejection). Relay it as an Anthropic error
+                            # event and end the stream instead of letting the
+                            # validation error escape and kill the API server.
+                            try:
+                                err = json.loads(data_str).get("error", {})
+                                message = err.get("message") or data_str
+                            except (ValueError, AttributeError):
+                                message = data_str
+                            error_response = AnthropicStreamEvent(
+                                type="error",
+                                error=AnthropicError(
+                                    type="invalid_request_error",
+                                    message=sanitize_message(str(message)),
+                                ),
+                            )
+                            yield wrap_data_with_event(
+                                error_response.model_dump_json(exclude_unset=True),
+                                "error",
+                            )
+                            return
 
                         if first_item:
                             chunk = AnthropicStreamEvent(

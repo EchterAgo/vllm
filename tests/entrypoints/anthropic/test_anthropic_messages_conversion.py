@@ -1842,6 +1842,65 @@ class TestClientErrorResponses:
 
 
 # ======================================================================
+# thinking config -> chat_template_kwargs mapping
+# ======================================================================
+
+
+class TestThinkingConfigMapping:
+    """The Anthropic `thinking` request field must reach the chat template.
+
+    Anthropic semantics: extended thinking is off unless the request carries
+    thinking: {"type": "enabled"}. Before this mapping existed the field was
+    silently dropped and the DeepSeek-V4 template default (thinking mode)
+    applied to every /v1/messages session, while the response parser expected
+    chat mode -- reasoning then streamed out as content and poisoned agentic
+    histories (wtdcode/vllm-backport#22).
+    """
+
+    def _kwargs(self, **request_kwargs):
+        # Built directly (not via _make_request) so an "enabled" thinking
+        # config can carry a budget the strict AnthropicThinkingConfigEnabled
+        # validator accepts (budget >= 1024 and < max_tokens).
+        req = AnthropicMessagesRequest(
+            model="test-model",
+            max_tokens=8192,
+            messages=[{"role": "user", "content": "hi"}],
+            **request_kwargs,
+        )
+        chat_req = AnthropicServingMessages._build_base_request(
+            req, [{"role": "user", "content": "hi"}]
+        )
+        return chat_req.chat_template_kwargs
+
+    def test_omitted_thinking_maps_to_disabled(self):
+        assert self._kwargs()["thinking"] is False
+
+    def test_enabled_thinking_maps_to_enabled(self):
+        kwargs = self._kwargs(thinking={"type": "enabled", "budget_tokens": 4096})
+        assert kwargs["thinking"] is True
+
+    def test_disabled_thinking_maps_to_disabled(self):
+        assert self._kwargs(thinking={"type": "disabled"})["thinking"] is False
+
+    def test_adaptive_thinking_maps_to_enabled(self):
+        """Newer Claude Code sends type "adaptive"; a closed literal 400s the
+        client at startup. Unknown modes must validate and mean thinking on."""
+        assert self._kwargs(thinking={"type": "adaptive"})["thinking"] is True
+
+    def test_explicit_template_kwargs_win(self):
+        kwargs = self._kwargs(
+            thinking={"type": "enabled", "budget_tokens": 4096},
+            chat_template_kwargs={"thinking": False},
+        )
+        assert kwargs["thinking"] is False
+
+    def test_enable_thinking_alias_wins(self):
+        kwargs = self._kwargs(chat_template_kwargs={"enable_thinking": True})
+        assert "thinking" not in kwargs
+        assert kwargs["enable_thinking"] is True
+
+
+# ======================================================================
 # thinking configuration pass-through
 # ======================================================================
 
