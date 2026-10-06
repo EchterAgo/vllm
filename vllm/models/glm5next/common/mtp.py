@@ -24,7 +24,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.model_executor.models.deepseek_mtp import SharedHead
 from vllm.model_executor.models.deepseek_v2 import DeepseekV2MixtureOfExperts
-from vllm.model_executor.models.utils import maybe_prefix
+from vllm.model_executor.models.utils import get_pp_missing_layer_names, maybe_prefix
 from vllm.models.glm5next.nvidia.ops.fused_eh_norm import fused_eh_norm
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -310,6 +310,7 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        pp_missing_layer_names = get_pp_missing_layer_names(self)
         _pending_wk_fp8: dict = {}
         # GLM-5.3-Flash NoPE checkpoints omit the RoPE rows from
         # ``kv_a_proj_with_mqa``; the FP8-to-BF16 path pads them for the model.
@@ -325,6 +326,18 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
             # prefix to match.
             if name.startswith("model.language_model."):
                 name = name.replace("model.language_model.", "model.", 1)
+            # The checkpoint stores embed_tokens once, as a top-level (tied)
+            # weight with no spec layer index. Without PP the draft shares the
+            # target's embedding afterwards, but under pipeline parallelism the
+            # target's embed_tokens is a PPMissingLayer on the draft's (last)
+            # stage, so the draft must load its own copy here or it drafts
+            # from uninitialized weights (acceptance collapses to ~0).
+            if name == "model.embed_tokens.weight" and name in params_dict:
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                loaded_params.add(name)
+                continue
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is None:
                 continue
@@ -338,6 +351,7 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
                 _pending_wk_fp8,
                 params_dict,
                 loaded_params,
+                pp_missing_layer_names,
             ):
                 continue
 
@@ -353,6 +367,7 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
                 params_dict,
                 loaded_params,
                 kv_a_pad_size,
+                pp_missing_layer_names,
             ):
                 continue
 
