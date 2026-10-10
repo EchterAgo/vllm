@@ -632,7 +632,6 @@ COPY . .
 # Drop the pre-built Rust artifacts into the source tree. setup.py detects
 # them and ships them as-is, skipping the local Rust build.
 COPY --from=rust-build /workspace/vllm/vllm-rs vllm/vllm-rs
-COPY --from=rust-build /workspace/vllm/_rust_*.so vllm/
 
 ARG GIT_REPO_CHECK=0
 RUN --mount=type=bind,source=.git,target=.git \
