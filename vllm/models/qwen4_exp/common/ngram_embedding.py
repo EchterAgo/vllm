@@ -222,6 +222,10 @@ class Qwen4ExpPLEEmbeddingMethod(QuantizeMethodBase):
         # Quark quantizes only Linear and MoE layers; PLE tables stay BF16.
         if isinstance(quant_config, QuarkConfig):
             return Qwen4ExpPLEUnquantizedEmbeddingMethod()
+        # AutoAWQ/GPTQModel gemm exports quantize only the routed-expert
+        # projections and keep the PLE table in checkpoint dtype (BF16).
+        if quant_config.get_name() == "auto_awq":
+            return Qwen4ExpPLEUnquantizedEmbeddingMethod()
         if isinstance(quant_config, Fp8Config):
             ignored_layers = quant_config.ignored_layers
             if is_layer_skipped(
