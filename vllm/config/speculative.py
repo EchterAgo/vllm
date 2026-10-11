@@ -35,6 +35,30 @@ else:
 
 logger = init_logger(__name__)
 
+# Positional-encoding keys that target and draft must share. Dict
+# ``--hf-overrides`` (the CLI path) otherwise never reach the draft, so YaRN
+# / RoPE extensions applied to the target leave the MTP draft on native rope
+# and speculative acceptance collapses past the draft's native window (#58080).
+_ROPE_HF_OVERRIDE_KEYS = frozenset(
+    {
+        "rope_scaling",
+        "rope_parameters",
+        "max_position_embeddings",
+        "original_max_position_embeddings",
+        "rope_theta",
+        "partial_rotary_factor",
+    }
+)
+# Nested HF configs that commonly wrap those rope fields (VL / hybrid).
+_NESTED_HF_CONFIG_KEYS = frozenset(
+    {
+        "text_config",
+        "language_config",
+        "llm_config",
+        "thinker_config",
+    }
+)
+
 MTPModelTypes = Literal[
     "deepseek_mtp",
     "dots3_note_mtp",
@@ -1169,8 +1193,50 @@ class SpeculativeConfig:
         return target_hf_overrides(hf_config)
 
     @staticmethod
+    def _select_draft_hf_overrides(
+        overrides: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Keep rope-relevant keys, including those nested under VL wrappers."""
+        selected: dict[str, Any] = {}
+        for key, value in overrides.items():
+            if key in _ROPE_HF_OVERRIDE_KEYS:
+                selected[key] = copy.deepcopy(value)
+            elif key in _NESTED_HF_CONFIG_KEYS and isinstance(value, Mapping):
+                nested = SpeculativeConfig._select_draft_hf_overrides(value)
+                if nested:
+                    selected[key] = nested
+        return selected
+
+    @staticmethod
+    def _apply_dict_then_arch_override(
+        target_hf_overrides: dict[str, Any],
+        hf_config: PreTrainedConfig,
+    ) -> PreTrainedConfig:
+        """Apply mapping-style rope overrides, then the draft arch rewrite.
+
+        Dict patches run first so nested keys such as
+        ``text_config.rope_parameters`` still exist on the original config.
+        Architecture mapping may later promote ``text_config`` to the top
+        level; applying after that would miss the nested path.
+
+        Nested overrides are only applied when the draft config actually has
+        that sub-config. External drafters (EAGLE, DFlash, ...) often ship a
+        flat config; setting ``text_config`` on them would create a bare dict
+        that ``get_text_config()`` then returns instead of the real config.
+        """
+        overrides = {
+            key: value
+            for key, value in target_hf_overrides.items()
+            if key not in _NESTED_HF_CONFIG_KEYS
+            or getattr(hf_config, key, None) is not None
+        }
+        ModelConfig._apply_dict_overrides(hf_config, overrides)
+        return SpeculativeConfig.hf_config_override(hf_config)
+
+    @staticmethod
     def compose_draft_hf_overrides(
         target_hf_overrides: HfOverrides | None,
+        forward_rope_overrides: bool = False,
     ) -> Callable[[PreTrainedConfig], PreTrainedConfig]:
         """Build the ``hf_overrides`` for the draft ``ModelConfig``.
 
@@ -1178,8 +1244,17 @@ class SpeculativeConfig:
         (e.g. test harnesses shrinking ``num_hidden_layers``) and must also
         reach the draft config — otherwise a draft belonging to a large
         target is instantiated at full size even when the target is shrunk.
-        Dict overrides are target-specific key patches and are not applied
-        to the draft.
+
+        Dict overrides are mostly target-specific key patches, but for a
+        native MTP draft (``forward_rope_overrides``) the rope-relevant keys
+        (``rope_parameters`` / ``rope_scaling`` / ``max_position_embeddings``,
+        including nested ``text_config``) must reach the draft: the MTP layer
+        is the target's own and shares its positional space, so a YaRN-extended
+        target with a native-encoding draft drops acceptance to 0% past the
+        draft's native ``max_position_embeddings`` (#58080). For every other
+        method the draft is a separate checkpoint that carries its own rope
+        layout (#54373) or an independent AR model that keeps its own context
+        limit (#48894), so dict overrides stay target-only.
 
         The composed override must stay picklable: the draft ``ModelConfig``
         is sent to spawned engine-core processes, so a local closure would
@@ -1187,11 +1262,26 @@ class SpeculativeConfig:
         target via ``functools.partial`` over a module-referenceable static
         method instead.
         """
-        if not callable(target_hf_overrides):
+        if callable(target_hf_overrides):
+            return functools.partial(
+                SpeculativeConfig._apply_composed_hf_override, target_hf_overrides
+            )
+
+        if (
+            not forward_rope_overrides
+            or not isinstance(target_hf_overrides, Mapping)
+            or not target_hf_overrides
+        ):
+            return SpeculativeConfig.hf_config_override
+
+        draft_overrides = SpeculativeConfig._select_draft_hf_overrides(
+            target_hf_overrides
+        )
+        if not draft_overrides:
             return SpeculativeConfig.hf_config_override
 
         return functools.partial(
-            SpeculativeConfig._apply_composed_hf_override, target_hf_overrides
+            SpeculativeConfig._apply_dict_then_arch_override, draft_overrides
         )
 
     @staticmethod
@@ -1360,11 +1450,14 @@ class SpeculativeConfig:
             self.prompt_lookup_min = 0
 
             if self.model is not None:
-                # Compose any callable hf_overrides set on the target so the
-                # draft config receives the same transform (e.g. the test
-                # shrink). Dict overrides stay target-only.
+                # Compose target hf_overrides onto the draft: callables
+                # (e.g. the test shrink) always, and rope-relevant dict
+                # keys (YaRN / RoPE) only for a native MTP draft, which
+                # shares the target's positional space. Other dict patches
+                # stay target-only (#48894, #54373).
                 draft_hf_overrides = SpeculativeConfig.compose_draft_hf_overrides(
-                    self.target_model_config.hf_overrides
+                    self.target_model_config.hf_overrides,
+                    forward_rope_overrides=self.method == "mtp",
                 )
                 self.draft_model_config = ModelConfig(
                     model=self.model,
