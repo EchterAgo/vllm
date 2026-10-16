@@ -788,16 +788,32 @@ class KVCacheManager:
 
         return cached_tokens or 0
 
-    def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
+    def cache_blocks(
+        self,
+        request: Request,
+        num_computed_tokens: int,
+        *,
+        committed: bool = False,
+    ) -> None:
         """Cache the blocks for the request, if enabled.
 
         Args:
             request: The request to cache the blocks.
             num_computed_tokens: The number of computed tokens, including tokens
                 that are already cached and tokens to be cached.
+            committed: Pass True when the worker has already confirmed writing
+                the bytes for these blocks (e.g. async-scheduler post-output
+                cache update, KV connector load completion). Skips eager
+                ``_uncommitted`` tracking so the entries are not evictable by a
+                subsequent ``rollback_uncommitted`` call.
 
         """
-        if self.enable_caching:
+        if not self.enable_caching:
+            return
+        if committed:
+            with self.block_pool.suppress_eager_tracking():
+                self.coordinator.cache_blocks(request, num_computed_tokens)
+        else:
             self.coordinator.cache_blocks(request, num_computed_tokens)
 
     def create_kv_cache_blocks(
@@ -944,3 +960,22 @@ class KVCacheManager:
         GPU write it enqueued has landed, so mamba state hashes published
         for it become safe to hit."""
         self.coordinator.commit_step(step_seq)
+
+    def begin_eager_step(self) -> None:
+        """Open this step's eager-registration bucket (upstream #43569).
+        Called at the top of ``schedule()``; the matching
+        ``commit_eager_step`` runs at the top of ``update_from_output`` for
+        the same step (the engine loop pairs the two 1:1, including
+        zero-token steps, so buckets never leak)."""
+        self.block_pool.begin_eager_step()
+
+    def commit_eager_step(self) -> None:
+        """Retire the oldest eager-registration bucket: its step's worker
+        writes are confirmed, so its entries can no longer be rolled back."""
+        self.block_pool.commit_eager_step()
+
+    def rollback_uncommitted(self, request_id: str) -> int:
+        """Evict a request's eager cache entries that the worker never wrote
+        (preempt/abort/load-failure), before its blocks are freed. Returns the
+        number of blocks evicted."""
+        return self.block_pool.rollback_eager_uncommitted(request_id)
