@@ -200,6 +200,18 @@ class EngineClient(ABC):
         ...
 
     @abstractmethod
+    async def set_dynamic_sd_schedule(
+        self, num_speculative_tokens_per_batch_size: list[list[int]] | None
+    ) -> list[int] | None:
+        """Hot-swap the dynamic speculative-decoding batch-size schedule."""
+        ...
+
+    @abstractmethod
+    async def get_dynamic_sd_schedule(self) -> list[int] | None:
+        """Return the current dense batch_size -> K speculative schedule."""
+        ...
+
+    @abstractmethod
     async def sleep(self, level: int = 1, mode: "PauseMode" = "abort") -> None:
         """Sleep the engine."""
         ...
