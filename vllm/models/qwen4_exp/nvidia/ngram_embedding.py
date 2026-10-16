@@ -207,6 +207,10 @@ class Qwen4ExpPLEEmbeddingMethod(QuantizeMethodBase):
                 "Qwen4Exp PLE embedding requires compressed-tensors checkpoints "
                 f"to leave {prefix} unquantized (add it to `ignore`)."
             )
+        if quant_config.get_name() == "auto_awq":
+            # AutoAWQ/GPTQModel gemm exports quantize only the routed-expert
+            # projections and keep the PLE table in checkpoint dtype (bf16).
+            return Qwen4ExpPLEUnquantizedEmbeddingMethod()
         if not isinstance(quant_config, Fp8Config):
             raise NotImplementedError(
                 "Qwen4Exp PLE embedding does not support quantization config "
