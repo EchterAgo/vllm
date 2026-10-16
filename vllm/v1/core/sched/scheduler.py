@@ -765,6 +765,11 @@ class Scheduler(SchedulerInterface):
         # The step this pass may schedule will get fence seq sched_step_seq + 1
         # (non-empty steps advance the fence at the end of schedule()); state
         # hashes published this pass are guarded behind that seq.
+        # Open this step's eager-registration bucket (upstream #43569) so
+        # hashes cached before the worker runs can be rolled back on
+        # preempt/abort; the matching commit runs at the top of
+        # update_from_output for the same step (the engine loop pairs them 1:1).
+        self.kv_cache_manager.begin_eager_step()
         self.kv_cache_manager.new_step_starts(self.sched_step_seq + 1)
 
         # DP prefill balancing: on a throttled (non-cadence-aligned) step, defer
@@ -2270,6 +2275,12 @@ class Scheduler(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        # Worker has confirmed writes for the step this schedule() opened a
+        # bucket for (upstream #43569); retire it before any finish-triggered
+        # free() runs below so valid entries survive. The engine loop calls
+        # this 1:1 with schedule(), including zero-token steps.
+        self.kv_cache_manager.commit_eager_step()
+
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
@@ -2422,9 +2433,14 @@ class Scheduler(SchedulerInterface):
                     and status_before_stop == RequestStatus.RUNNING
                     and (has_output_placeholders or self.num_spec_tokens > 0)
                 ):
+                    # Worker has already confirmed these bytes (we're past the
+                    # step's output processing), so register as committed
+                    # (upstream #43569) -- must not be evictable by a later
+                    # rollback_uncommitted call.
                     self.kv_cache_manager.cache_blocks(
                         request,
                         request.num_computed_tokens - request.num_in_flight_tokens,
+                        committed=True,
                     )
             elif request.pooling_params and pooler_output is not None:
                 # Pooling stops as soon as there is output.
@@ -3096,6 +3112,14 @@ class Scheduler(SchedulerInterface):
         """Free the request's KV blocks, deferring the return to the block
         pool when an in-flight GPU step may still write them.
         """
+        # Evict eager prefix-cache registrations the worker never confirmed
+        # (upstream #43569): a preempted/aborted request's hashes would
+        # otherwise let a later request hit never-written KV. On the normal
+        # finish path this is a no-op -- update_from_output commits the
+        # finished step's bucket before freeing -- and on the deferred path
+        # the entries would be dropped at block reuse anyway, only after
+        # serving stale hits in the meantime.
+        self.kv_cache_manager.rollback_uncommitted(request.request_id)
         if self._request_blocks_can_be_freed(request):
             self.kv_cache_manager.free(request)
             return
@@ -3490,8 +3514,12 @@ class Scheduler(SchedulerInterface):
             # Request had KV load failures; num_computed_tokens was already
             # updated in _update_requests_with_invalid_blocks
             if request.num_computed_tokens:
-                # Cache any valid computed tokens.
-                self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens)
+                # Cache any valid computed tokens. These bytes are
+                # connector-loaded (valid by construction), so register as
+                # committed to keep them safe from later rollbacks.
+                self.kv_cache_manager.cache_blocks(
+                    request, request.num_computed_tokens, committed=True
+                )
                 if self.needs_kv_cache_zeroing:
                     # The failed load left the blocks beyond the valid
                     # prefix unwritten and their zeroing was skipped; zero
@@ -3501,16 +3529,22 @@ class Scheduler(SchedulerInterface):
                     )
             else:
                 # No valid computed tokens, release allocated blocks.
-                # There may be a local cache hit on retry.
+                # There may be a local cache hit on retry. KV load failed,
+                # so evict any eager zombies before releasing.
                 # (Freed blocks are re-recorded for zeroing when
                 # reallocated, so the skipped blocks need no handling.)
+                self.kv_cache_manager.rollback_uncommitted(request.request_id)
                 self.kv_cache_manager.free(request)
 
             self.failed_recving_kv_req_ids.remove(request.request_id)
         else:
             # Now that the blocks are ready, actually cache them.
             # This will cache the blocks iff caching is enabled.
-            self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens)
+            # Bytes are connector-loaded and confirmed, so register as
+            # committed (upstream #43569).
+            self.kv_cache_manager.cache_blocks(
+                request, request.num_computed_tokens, committed=True
+            )
 
         # DSV41 SWA bounded replay recomputes the tail of a hit loaded without
         # its window, or of a failed load, which may have lost it; the replay
