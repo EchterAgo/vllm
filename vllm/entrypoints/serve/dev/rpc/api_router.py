@@ -20,6 +20,55 @@ def engine_client(request: Request) -> EngineClient:
     return request.app.state.engine_client
 
 
+@router.post("/set_dynamic_sd_schedule")
+async def set_dynamic_sd_schedule(raw_request: Request):
+    """Hot-swap the dynamic speculative-decoding batch-size schedule.
+
+    Body: ``{"num_speculative_tokens_per_batch_size": [[start, end, K], ...]}``
+    or ``{"num_speculative_tokens_per_batch_size": null}`` to disable dynamic
+    SD (fall back to the static max K). Requires an idle engine and that every
+    K was captured at boot (present in the boot schedule's CUDA-graph tiers).
+    Returns the resulting dense ``batch_size -> K`` lookup.
+    """
+    try:
+        body = await raw_request.json()
+    except json.JSONDecodeError as e:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"JSON decode error: {e}",
+        ) from e
+    if not isinstance(body, dict):
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail="Request body must be a JSON object",
+        )
+    schedule = body.get("num_speculative_tokens_per_batch_size")
+    if schedule is not None and not isinstance(schedule, list):
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail="'num_speculative_tokens_per_batch_size' must be a list or null",
+        )
+    try:
+        lookup = await engine_client(raw_request).set_dynamic_sd_schedule(schedule)
+    except Exception as e:  # noqa: BLE001 - core wraps utility failures generically
+        msg = str(e)
+        if "idle engine" in msg:
+            raise HTTPException(
+                status_code=HTTPStatus.CONFLICT.value, detail=msg
+            ) from e
+        raise HTTPException(
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=msg
+        ) from e
+    return JSONResponse(content={"dense_schedule": lookup})
+
+
+@router.get("/get_dynamic_sd_schedule")
+async def get_dynamic_sd_schedule(raw_request: Request):
+    """Return the current dense ``batch_size -> K`` speculative schedule."""
+    lookup = await engine_client(raw_request).get_dynamic_sd_schedule()
+    return JSONResponse(content={"dense_schedule": lookup})
+
+
 @router.post("/collective_rpc")
 async def collective_rpc(raw_request: Request):
     try:

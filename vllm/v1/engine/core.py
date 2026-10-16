@@ -903,6 +903,26 @@ class EngineCore:
             reset_running_requests, reset_connector
         )
 
+    def set_dynamic_sd_schedule(
+        self, num_speculative_tokens_per_batch_size: list[list[int]] | None
+    ) -> list[int] | None:
+        """Hot-swap the dynamic speculative-decoding batch-size schedule at
+        runtime without an engine restart. See Scheduler.set_dynamic_sd_schedule
+        for constraints (idle engine; K values must exist in the boot schedule's
+        captured CUDA-graph tiers)."""
+        if self.scheduler.has_unfinished_requests():
+            raise RuntimeError(
+                "set_dynamic_sd_schedule requires an idle engine: requests are "
+                "still running and their in-flight drafts were produced under "
+                "the previous schedule."
+            )
+        return self.scheduler.set_dynamic_sd_schedule(
+            num_speculative_tokens_per_batch_size
+        )
+
+    def get_dynamic_sd_schedule(self) -> list[int] | None:
+        return self.scheduler.get_dynamic_sd_schedule()
+
     def reset_encoder_cache(self) -> None:
         """Reset the encoder cache to invalidate all cached encoder outputs.
 
