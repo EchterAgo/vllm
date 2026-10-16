@@ -73,8 +73,13 @@ class AsyncScheduler(Scheduler):
             assert request.num_output_placeholders >= 0
 
         # Cache the new tokens. Preempted requests should be skipped.
+        # Worker has already confirmed these bytes (we're past the step's
+        # output processing), so register as committed (upstream #43569) --
+        # must not be evictable by a later rollback_uncommitted call.
         if status_before_update == RequestStatus.RUNNING:
             self.kv_cache_manager.cache_blocks(
-                request, request.num_computed_tokens - request.num_output_placeholders
+                request,
+                request.num_computed_tokens - request.num_output_placeholders,
+                committed=True,
             )
         return new_token_ids, stopped

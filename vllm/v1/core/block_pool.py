@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections import deque
 from collections.abc import Callable, Iterable, Sequence
+from contextlib import contextmanager
 from typing import Any
 
 from vllm.distributed.kv_events import (
@@ -194,6 +196,65 @@ class BlockPool:
         # Callbacks for blocks released with ``unpin_blocks`` whose contents
         # are still being read until the pool reuses them.
         self._reuse_watchers: dict[int, Callable[[KVCacheBlock], None]] = {}
+        # FIFO of eager-registration buckets, one per in-flight scheduler step
+        # (upstream #43569). ``cache_full_blocks``/``cache_partial_block``
+        # register a block's hash before the worker writes its bytes; if the
+        # request is preempted/aborted first, the hash is a "zombie" that a
+        # later request can hit on never-written KV. ``begin_eager_step`` opens
+        # a bucket, ``commit_eager_step`` retires the oldest, and
+        # ``rollback_eager_uncommitted`` evicts a freed request's pending
+        # entries. Independent of the Mamba publish fence (``_hash_publish_step``
+        # / ``commit_step``), which guards state-block *content* rather than
+        # eager *registration*.
+        self._eager_uncommitted: deque[dict[str, list[KVCacheBlock]]] = deque()
+        # When True, registration skips ``_eager_uncommitted`` tracking. Used by
+        # worker-confirmed paths (async-scheduler post-output, connector load
+        # completion) whose bytes are already valid and must not be rolled back.
+        self._suppress_eager_tracking: bool = False
+
+    def begin_eager_step(self) -> None:
+        """Open a new eager-registration bucket for the current step."""
+        self._eager_uncommitted.append({})
+
+    def commit_eager_step(self) -> None:
+        """Retire the oldest pending bucket (its step's writes are confirmed).
+        Idempotent."""
+        if self._eager_uncommitted:
+            self._eager_uncommitted.popleft()
+
+    @contextmanager
+    def suppress_eager_tracking(self):
+        """Skip ``_eager_uncommitted`` tracking within this context. Used by
+        paths that register cache entries whose KV bytes are already
+        worker-confirmed (async-scheduler post-output, connector load
+        completion), so a later rollback must not evict them.
+        """
+        prev = self._suppress_eager_tracking
+        self._suppress_eager_tracking = True
+        try:
+            yield
+        finally:
+            self._suppress_eager_tracking = prev
+
+    def _track_eager_uncommitted(
+        self, request_id: str, block: KVCacheBlock
+    ) -> None:
+        """Record a freshly-registered block in the current step's bucket."""
+        if self._suppress_eager_tracking or not self._eager_uncommitted:
+            return
+        self._eager_uncommitted[-1].setdefault(request_id, []).append(block)
+
+    def rollback_eager_uncommitted(self, request_id: str) -> int:
+        """Evict ``request_id``'s uncommitted cache entries across all buckets.
+        Called by the preempt/abort paths before freeing the request's blocks.
+        Returns the number of blocks evicted.
+        """
+        evicted = 0
+        for bucket in self._eager_uncommitted:
+            blocks = bucket.pop(request_id, None)
+            if blocks:
+                evicted += sum(self._maybe_evict_cached_block(b) for b in blocks)
+        return evicted
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -297,6 +358,7 @@ class BlockPool:
                 blk,
                 num_tokens=num_hash_tokens,
             )
+            self._track_eager_uncommitted(request.request_id, blk)
             if new_hashes is not None:
                 new_hashes.append(maybe_convert_block_hash(block_hash))
 
@@ -521,6 +583,7 @@ class BlockPool:
             block,
             num_tokens=num_hash_blocks * self.hash_block_size,
         )
+        self._track_eager_uncommitted(request.request_id, block)
         if self.enable_kv_cache_events and not already_cached:
             parent_hash, block_start = self._get_partial_block_parent_hash_and_start(
                 request, num_tokens
@@ -850,6 +913,7 @@ class BlockPool:
         # Remove all hashes so that no new blocks will hit.
         self.cached_block_hash_to_block = BlockHashToBlockMap()
         self.cached_block_hashes_by_block.clear()
+        self._eager_uncommitted.clear()
         if self._reuse_watchers:
             self._notify_reuse(
                 [self.blocks[block_id] for block_id in list(self._reuse_watchers)]
