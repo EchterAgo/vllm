@@ -3006,6 +3006,33 @@ class Scheduler(SchedulerInterface):
 
         return reset_successful
 
+    def set_dynamic_sd_schedule(
+        self, num_speculative_tokens_per_batch_size: list[list[int]] | None
+    ) -> list[int] | None:
+        """Hot-swap the dynamic speculative-decoding batch-size schedule.
+
+        Rebuilds the dense ``batch_size -> K`` lookup the scheduler reads each
+        step. ``None`` disables dynamic SD (every step uses the static max K).
+        The worker's draft width is fixed at boot to ``num_speculative_tokens``
+        (the max K) and CUDA-graph decode tiers are captured from the boot
+        schedule, so any K used here must be <= that max and, for full-graph
+        replay, present in the boot schedule's captured tiers. Call only while
+        the engine is idle (no running requests).
+        """
+        if num_speculative_tokens_per_batch_size is not None:
+            self.dynamic_sd_lookup = build_dynamic_sd_schedule_lookup(
+                num_speculative_tokens_per_batch_size,
+                vllm_max_batch_size=self.scheduler_config.max_num_seqs,
+                vllm_num_speculative_tokens=self.num_spec_tokens,
+            )
+        else:
+            self.dynamic_sd_lookup = None
+        return self.dynamic_sd_lookup
+
+    def get_dynamic_sd_schedule(self) -> list[int] | None:
+        """Return the current dense ``batch_size -> K`` lookup (index 0 unused)."""
+        return self.dynamic_sd_lookup
+
     def reset_connector_cache(self) -> bool:
         if self.connector is None:
             # No connector attached -> nothing to reset, treat as success so

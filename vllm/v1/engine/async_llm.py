@@ -1163,6 +1163,16 @@ class AsyncLLM(EngineClient):
             reset_running_requests, reset_connector
         )
 
+    async def set_dynamic_sd_schedule(
+        self, num_speculative_tokens_per_batch_size: list[list[int]] | None
+    ) -> list[int] | None:
+        return await self.engine_core.set_dynamic_sd_schedule_async(
+            num_speculative_tokens_per_batch_size
+        )
+
+    async def get_dynamic_sd_schedule(self) -> list[int] | None:
+        return await self.engine_core.get_dynamic_sd_schedule_async()
+
     async def reset_encoder_cache(self) -> None:
         await self.engine_core.reset_encoder_cache_async()
 

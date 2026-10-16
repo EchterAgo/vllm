@@ -198,6 +198,14 @@ class EngineCoreClient(ABC):
     ) -> bool:
         raise NotImplementedError
 
+    def set_dynamic_sd_schedule(
+        self, num_speculative_tokens_per_batch_size: list[list[int]] | None
+    ) -> list[int] | None:
+        raise NotImplementedError
+
+    def get_dynamic_sd_schedule(self) -> list[int] | None:
+        raise NotImplementedError
+
     def reset_encoder_cache(self) -> None:
         raise NotImplementedError
 
@@ -295,6 +303,14 @@ class EngineCoreClient(ABC):
     async def reset_prefix_cache_async(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:
+        raise NotImplementedError
+
+    async def set_dynamic_sd_schedule_async(
+        self, num_speculative_tokens_per_batch_size: list[list[int]] | None
+    ) -> list[int] | None:
+        raise NotImplementedError
+
+    async def get_dynamic_sd_schedule_async(self) -> list[int] | None:
         raise NotImplementedError
 
     async def reset_encoder_cache_async(self) -> None:
@@ -425,6 +441,16 @@ class InprocClient(EngineCoreClient):
         return self.engine_core.reset_prefix_cache(
             reset_running_requests, reset_connector
         )
+
+    def set_dynamic_sd_schedule(
+        self, num_speculative_tokens_per_batch_size: list[list[int]] | None
+    ) -> list[int] | None:
+        return self.engine_core.set_dynamic_sd_schedule(
+            num_speculative_tokens_per_batch_size
+        )
+
+    def get_dynamic_sd_schedule(self) -> list[int] | None:
+        return self.engine_core.get_dynamic_sd_schedule()
 
     def reset_encoder_cache(self) -> None:
         self.engine_core.reset_encoder_cache()
@@ -1052,6 +1078,16 @@ class SyncMPClient(MPClient):
             "reset_prefix_cache", reset_running_requests, reset_connector
         )
 
+    def set_dynamic_sd_schedule(
+        self, num_speculative_tokens_per_batch_size: list[list[int]] | None
+    ) -> list[int] | None:
+        return self.call_utility(
+            "set_dynamic_sd_schedule", num_speculative_tokens_per_batch_size
+        )
+
+    def get_dynamic_sd_schedule(self) -> list[int] | None:
+        return self.call_utility("get_dynamic_sd_schedule")
+
     def reset_encoder_cache(self) -> None:
         self.call_utility("reset_encoder_cache")
 
@@ -1339,6 +1375,16 @@ class AsyncMPClient(MPClient):
                 "reset_prefix_cache", reset_running_requests, reset_connector
             )
         )
+
+    async def set_dynamic_sd_schedule_async(
+        self, num_speculative_tokens_per_batch_size: list[list[int]] | None
+    ) -> list[int] | None:
+        return await self.call_utility_async(
+            "set_dynamic_sd_schedule", num_speculative_tokens_per_batch_size
+        )
+
+    async def get_dynamic_sd_schedule_async(self) -> list[int] | None:
+        return await self.call_utility_async("get_dynamic_sd_schedule")
 
     async def reset_encoder_cache_async(self) -> None:
         await self.call_utility_async("reset_encoder_cache")
