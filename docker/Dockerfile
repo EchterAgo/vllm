@@ -967,11 +967,20 @@ RUN --mount=type=cache,target=/opt/uv/cache \
     fi && \
     rm /tmp/requirements-cuda.txt /tmp/common.txt
 
-# Install FlashInfer's precompiled kernels for all GPU architectures (the default).
-# `vllm download-kernels` wraps this command but vLLM is only installed in later
-# stages, and running it there would rebuild this large layer for every wheel.
+# Install FlashInfer's precompiled kernels. `vllm download-kernels` wraps this
+# command but vLLM is only installed in later stages, and running it there would
+# rebuild this large layer for every wheel.
+# Without --sm, flashinfer installs every published jit-cache provider (~1.2 GB);
+# derive the target architectures from torch_cuda_arch_list instead. FlashInfer
+# normalizes bare arch values (e.g. "8.0" -> sm80, "9.0a" -> sm90a).
+# Do not add +PTX here; see the main TORCH_CUDA_ARCH_LIST comment above.
+ARG torch_cuda_arch_list='7.5 8.0 8.6 8.9 9.0 10.0 11.0 12.0'
 RUN --mount=type=cache,target=/opt/pip/cache \
-    PIP_CACHE_DIR=/opt/pip/cache flashinfer download-kernels
+    SM_ARGS=""; \
+    for arch in ${torch_cuda_arch_list}; do \
+        SM_ARGS="${SM_ARGS} --sm ${arch}"; \
+    done; \
+    PIP_CACHE_DIR=/opt/pip/cache flashinfer download-kernels ${SM_ARGS}
 
 # ============================================================
 # OPENAI API SERVER DEPENDENCIES
