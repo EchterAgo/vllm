@@ -424,6 +424,10 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
         assert num_accepted_tokens is not None
         non_spec_req_idx: torch.Tensor | None = None
 
+        # Hoisted out of the mixed-batch branch below: the PLE align-fields
+        # call references it for every batch, including all-speculative ones.
+        spec_req_idx_cpu = spec_sequence_masks_cpu.nonzero(as_tuple=True)[0]
+
         if num_decodes == 0 and num_prefills == 0:
             # All real requests are speculative; zero-length padding is trailing.
             spec_token_indx = None
@@ -440,7 +444,6 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
             # request order. This yields spec tokens first, then the non-spec
             # [decode, prefill] tokens.
             query_lens = torch.diff(query_start_loc)
-            spec_req_idx_cpu = spec_sequence_masks_cpu.nonzero(as_tuple=True)[0]
             decode_req_idx_cpu = decode_mask_cpu.nonzero(as_tuple=True)[0]
             prefill_req_idx_cpu = prefill_mask_cpu.nonzero(as_tuple=True)[0]
             non_spec_req_idx_cpu = torch.cat((decode_req_idx_cpu, prefill_req_idx_cpu))
