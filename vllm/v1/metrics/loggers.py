@@ -160,8 +160,9 @@ class LoggingStatLogger(StatLoggerBase):
 
     def _track_iteration_stats(self, iteration_stats: IterationStats):
         # Save tracked stats for token counters.
-        # Use computed tokens for prompt throughput (excludes cached/transferred)
-        self.num_prompt_tokens += iteration_stats.prompt_token_stats.computed
+        # Prompt throughput is tracked per step from scheduler_stats
+        # (see record()) so chunked prefill is reported incrementally
+        # rather than lumped at the first output token.
         self.num_generation_tokens += iteration_stats.num_generation_tokens
         self.num_corrupted_reqs += iteration_stats.num_corrupted_reqs
         self.num_preemptions += iteration_stats.num_preempted_reqs
@@ -226,6 +227,10 @@ class LoggingStatLogger(StatLoggerBase):
             self._track_iteration_stats(iteration_stats)
 
         if scheduler_stats is not None:
+            # Prompt tokens forward-passed this step (incremental local prefill
+            # compute). Accumulated per step so "Avg prompt throughput" reflects
+            # ongoing chunked prefill instead of jumping at the first token.
+            self.num_prompt_tokens += scheduler_stats.num_prefill_tokens
             self._log_iteration_details(scheduler_stats, engine_idx)
             self.prefix_caching_metrics.observe(scheduler_stats.prefix_cache_stats)
 
