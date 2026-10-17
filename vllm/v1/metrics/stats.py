@@ -254,6 +254,12 @@ class SchedulerStats:
 
     perf_stats: PerfStats | None = None
 
+    # Prompt tokens forward-passed (local prefill compute) during this step.
+    # Reported per step so "Avg prompt throughput" reflects ongoing chunked
+    # prefill instead of arriving in one lump when the prompt's first output
+    # token is emitted. Cached/transferred tokens are excluded (not scheduled).
+    num_prefill_tokens: int = 0
+
 
 @dataclass
 class RequestStateStats:

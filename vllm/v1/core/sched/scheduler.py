@@ -2162,6 +2162,19 @@ class Scheduler(SchedulerInterface):
             model_runner_output.prompt_token_id_logprobs_dict
         )
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+        # Prompt tokens forward-passed this step: scheduled tokens for requests
+        # still in the prefill (context) phase. Cached/externally-transferred
+        # tokens are not scheduled, so this is incremental local prefill compute.
+        # Reported per step so "Avg prompt throughput" tracks ongoing chunked
+        # prefill instead of arriving in one lump at the first output token.
+        new_req_ids = {
+            new_req.req_id for new_req in scheduler_output.scheduled_new_reqs
+        }
+        cached_reqs = scheduler_output.scheduled_cached_reqs
+        num_prefill_tokens = 0
+        for req_id, num_tokens in num_scheduled_tokens.items():
+            if req_id in new_req_ids or cached_reqs.is_context_phase(req_id):
+                num_prefill_tokens += num_tokens
         pooler_outputs = model_runner_output.pooler_output
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
@@ -2544,6 +2557,7 @@ class Scheduler(SchedulerInterface):
                 cudagraph_stats,
                 perf_stats,
                 ec_connector_stats=ec_connector_stats,
+                num_prefill_tokens=num_prefill_tokens,
             )
         ) is not None:
             # Return stats to only one of the front-ends.
@@ -3089,6 +3103,7 @@ class Scheduler(SchedulerInterface):
         cudagraph_stats: CUDAGraphStat | None = None,
         perf_stats: PerfStats | None = None,
         ec_connector_stats: ECConnectorStats | None = None,
+        num_prefill_tokens: int = 0,
     ) -> SchedulerStats | None:
         if not self.log_stats:
             return None
@@ -3126,6 +3141,7 @@ class Scheduler(SchedulerInterface):
             cudagraph_stats=cudagraph_stats,
             perf_stats=perf_stats,
             ec_connector_stats=ec_connector_stats_payload,
+            num_prefill_tokens=num_prefill_tokens,
         )
 
     def make_spec_decoding_stats(
