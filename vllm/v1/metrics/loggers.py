@@ -1194,6 +1194,36 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                         *labelvalues, tier.value
                     ).inc(num_tokens)
 
+            # Prompt-token counters are fed per scheduler step so that
+            # rate(vllm:prompt_tokens_total) tracks ongoing chunked prefill
+            # instead of arriving in one lump when the prompt's first output
+            # token is emitted. A step's prompt tokens = local prefill compute
+            # (scheduled context tokens) + cached tokens adopted this step
+            # (local prefix hits + external KV hits). Cached tokens are adopted
+            # at admission (instantaneous); compute is spread across the
+            # prompt's chunks. These are the same per-step deltas already used
+            # by prompt_tokens_cached_by_source above.
+            external_cached_tokens = (
+                connector_stats.hits if connector_stats is not None else 0
+            )
+            local_cached_tokens = scheduler_stats.prefix_cache_stats.hits
+            computed_tokens = scheduler_stats.num_prefill_tokens
+            self.counter_prompt_tokens[engine_idx].inc(
+                computed_tokens + local_cached_tokens + external_cached_tokens
+            )
+            self.counter_prompt_tokens_by_source["local_compute"][engine_idx].inc(
+                computed_tokens
+            )
+            self.counter_prompt_tokens_by_source["local_cache_hit"][engine_idx].inc(
+                local_cached_tokens
+            )
+            self.counter_prompt_tokens_by_source["external_kv_transfer"][
+                engine_idx
+            ].inc(external_cached_tokens)
+            self.counter_prompt_tokens_cached[engine_idx].inc(
+                local_cached_tokens + external_cached_tokens
+            )
+
             if scheduler_stats.spec_decoding_stats is not None:
                 self.spec_decoding_prom.observe(
                     scheduler_stats.spec_decoding_stats, engine_idx
@@ -1264,14 +1294,10 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         self.counter_num_preempted_reqs[engine_idx].inc(
             iteration_stats.num_preempted_reqs
         )
-        self.counter_prompt_tokens[engine_idx].inc(iteration_stats.num_prompt_tokens)
-        # Labeled prompt token counters by source
-        pts = iteration_stats.prompt_token_stats
-        for source in PromptTokenStats.ALL_SOURCES:
-            self.counter_prompt_tokens_by_source[source][engine_idx].inc(
-                pts.get_by_source(source)
-            )
-        self.counter_prompt_tokens_cached[engine_idx].inc(pts.cached_tokens)
+        # NOTE: prompt-token counters (vllm:prompt_tokens, *_by_source,
+        # *_cached) are now fed per scheduler step from scheduler_stats above,
+        # not from the lumped iteration_stats (which only carries a prompt's
+        # tokens at its first output token). generation tokens stay here.
         self.counter_generation_tokens[engine_idx].inc(
             iteration_stats.num_generation_tokens
         )
