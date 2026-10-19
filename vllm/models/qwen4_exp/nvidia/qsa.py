@@ -16,6 +16,7 @@ from vllm.config import VllmConfig
 from vllm.config.cache import CacheConfig, CacheDType
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import (
     set_default_quant_scales,
 )
@@ -62,6 +63,8 @@ from vllm.v1.kv_cache_interface import (
 from ..common.qsa_cache import QSAForwardMetadata
 from . import model
 from .indexer_qsa import QSAIndexer
+
+logger = init_logger(__name__)
 
 
 class Qwen4ExpQSAQKVIndexerLinear(MergedColumnParallelLinear):
@@ -545,6 +548,32 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 }
             )
         return AutoWeightsLoader(self).load_weights(weights, mapper=mapper)
+
+    def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
+        # The QSA read path (forward_qsa / indexer) dequantizes the fp8 cache
+        # with the host floats ``_k_scale_float``/``_v_scale_float``, while the
+        # write path (``do_kv_cache_update`` -> ``reshape_and_cache_flash``)
+        # quantizes with the device buffers ``_k_scale``/``_v_scale``. Weight
+        # loading fills only the buffers (the checkpoint's ``k_scale``/
+        # ``v_scale`` are remapped onto them); the floats stay at the 1.0
+        # default from ``set_default_quant_scales``. Sync them here so the
+        # calibrated scales are actually applied on dequant, matching the
+        # generic Attention + BaseKVCacheMethod path.
+        if self.kv_cache_dtype not in ("fp8", "fp8_e4m3"):
+            return
+        k_scale = float(self._k_scale.detach().to("cpu").item())
+        v_scale = float(self._v_scale.detach().to("cpu").item())
+        self._k_scale_float = k_scale
+        self._v_scale_float = v_scale
+        self._k_scale_cpu.fill_(k_scale)
+        self._v_scale_cpu.fill_(v_scale)
+        if k_scale == 1.0 and v_scale == 1.0:
+            logger.warning_once(
+                "QSA fp8 KV cache is using scaling factor 1.0 for %s. "
+                "If this is unintended, verify that k/v_scale scaling "
+                "factors are present in the checkpoint.",
+                self.kv_cache_dtype,
+            )
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return self.attn_backend
