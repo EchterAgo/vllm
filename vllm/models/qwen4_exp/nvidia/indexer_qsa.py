@@ -307,6 +307,12 @@ class QSAIndexer(nn.Module):
             main_kv_cache = attn.kv_cache.transpose(1, 2)
             if attn.kv_cache_dtype in ("fp8", "fp8_e4m3"):
                 main_kv_cache = main_kv_cache.view(torch.float8_e4m3fn)
+            if attn.impl._pth:
+                _, _, main_k_scale_cache, main_v_scale_cache = (
+                    attn.impl._pth_caches(attn.kv_cache)
+                )
+            else:
+                main_k_scale_cache = main_v_scale_cache = None
             main_outputs = qsa_prepare(
                 projected_q,
                 raw_keys,
@@ -339,6 +345,8 @@ class QSAIndexer(nn.Module):
                 main_slot_mapping=slot_mapping[:num_tokens],
                 main_k_scale=attn._k_scale_float,
                 main_v_scale=attn._v_scale_float,
+                main_k_scale_cache=main_k_scale_cache,
+                main_v_scale_cache=main_v_scale_cache,
             )
         else:
             # Unfused reference path

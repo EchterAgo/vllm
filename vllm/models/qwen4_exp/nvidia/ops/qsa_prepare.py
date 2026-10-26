@@ -101,6 +101,51 @@ def _store_rotated(dst, y, o1, o2, scale):
     tl.store(dst + HALF + rot, _to_dst_dtype(o2, dst, scale))
 
 
+@triton.jit
+def _quant_scale(x, QUANT_MAX: tl.constexpr):
+    """Per-(token, head) absmax scale, matching the unfused writer."""
+    return tl.maximum(tl.max(tl.abs(x)) / QUANT_MAX, 1e-6)
+
+
+@triton.jit
+def _quant_store(dst, x, inv, QUANT_MIN: tl.constexpr, QUANT_MAX: tl.constexpr):
+    """Quantize ``x`` (already BF16-rounded fp32) with ``inv = 1 / scale``.
+
+    Round-half-away-from-zero before the integer store truncates, clamped to
+    the cache's quant range. Mirrors ``_reshape_cache_per_token_head``.
+    """
+    q = x * inv
+    q = tl.where(q >= 0, q + 0.5, q - 0.5)
+    return tl.clamp(q, QUANT_MIN, QUANT_MAX).to(dst.dtype.element_ty)
+
+
+@triton.jit
+def _store_rotated_quant(dst, scale_dst_ptr, y, o1, o2, QUANT_MIN: tl.constexpr, QUANT_MAX: tl.constexpr):
+    """Store a rotated head as per-(token, head) quantized data + its scale.
+
+    The head is ``[o1 | o2 | y[2*HALF:]]``; the scale is the absmax over the
+    whole rotated vector, so it must be reduced before any part is stored.
+    Inputs are rounded to BF16 first: the unfused writer quantizes the BF16
+    K/V it is handed, so the scale and the quantized values see identical
+    inputs on both paths.
+    """
+    HALF: tl.constexpr = o1.shape[0]
+    dims = tl.arange(0, y.shape[0])
+    rot = tl.arange(0, HALF)
+    tail = dims >= 2 * HALF
+    y_f = y.to(tl.bfloat16).to(tl.float32)
+    o1_f = o1.to(tl.bfloat16).to(tl.float32)
+    o2_f = o2.to(tl.bfloat16).to(tl.float32)
+    amax = tl.max(tl.maximum(tl.abs(o1_f), tl.abs(o2_f)))
+    amax = tl.maximum(amax, tl.max(tl.where(tail, tl.abs(y_f), 0.0)))
+    scale = tl.maximum(amax / QUANT_MAX, 1e-6)
+    inv = 1.0 / scale
+    tl.store(scale_dst_ptr, scale)
+    tl.store(dst + dims, _quant_store(dst, y_f, inv, QUANT_MIN, QUANT_MAX), mask=tail)
+    tl.store(dst + rot, _quant_store(dst, o1_f, inv, QUANT_MIN, QUANT_MAX))
+    tl.store(dst + HALF + rot, _quant_store(dst, o2_f, inv, QUANT_MIN, QUANT_MAX))
+
+
 @triton.jit(
     do_not_specialize=[
         "num_tokens",
@@ -167,10 +212,25 @@ def _qsa_prepare_kernel(
     main_slots_ptr,
     main_k_scale,
     main_v_scale,
+    main_k_scale_cache_ptr,
+    main_v_scale_cache_ptr,
+    ks_stride_block,
+    ks_stride_slot,
+    ks_stride_head,
+    vs_stride_block,
+    vs_stride_slot,
+    vs_stride_head,
     MAIN_HQ: tl.constexpr,
     MAIN_HK: tl.constexpr,
     MAIN_D: tl.constexpr,
     MAIN_PAGE_SIZE: tl.constexpr,
+    # Per-(token, head) quantized cache: the V data sits at ``MAIN_V_OFF``
+    # (``head_dim + scale_pad``) inside the page, not at ``MAIN_D``; equal for
+    # the unquantized layouts. ``QUANT`` selects the quantizing store.
+    MAIN_V_OFF: tl.constexpr,
+    QUANT: tl.constexpr,
+    QUANT_MIN: tl.constexpr,
+    QUANT_MAX: tl.constexpr,
 ):
     pid = tl.program_id(0)
     num_index_work = num_k_work + tl.cdiv(num_tokens, TILE_T_Q) * tl.cdiv(HQ, TILE_H_Q)
@@ -219,15 +279,46 @@ def _qsa_prepare_kernel(
         if is_k:
             slot = tl.load(main_slots_ptr + token).to(tl.int64)
             if slot >= 0:
+                page = slot // MAIN_PAGE_SIZE
+                in_page = slot % MAIN_PAGE_SIZE
                 dst = (
                     main_cache_ptr
-                    + (slot // MAIN_PAGE_SIZE) * main_cache_stride_block
-                    + (slot % MAIN_PAGE_SIZE) * main_cache_stride_token
+                    + page * main_cache_stride_block
+                    + in_page * main_cache_stride_token
                     + kv_head * main_cache_stride_head
                 )
-                _store_rotated(dst, y, o1, o2, main_k_scale)
                 v = tl.load(src + MAIN_HK * MAIN_D + dims)
-                tl.store(dst + MAIN_D + dims, _to_dst_dtype(v, dst, main_v_scale))
+                if QUANT:
+                    k_scale_dst = (
+                        main_k_scale_cache_ptr
+                        + page * ks_stride_block
+                        + in_page * ks_stride_slot
+                        + kv_head * ks_stride_head
+                    )
+                    v_scale_dst = (
+                        main_v_scale_cache_ptr
+                        + page * vs_stride_block
+                        + in_page * vs_stride_slot
+                        + kv_head * vs_stride_head
+                    )
+                    _store_rotated_quant(
+                        dst, k_scale_dst, y, o1, o2, QUANT_MIN, QUANT_MAX
+                    )
+                    v_f = v.to(tl.bfloat16).to(tl.float32)
+                    v_scale = _quant_scale(v_f, QUANT_MAX)
+                    tl.store(v_scale_dst, v_scale)
+                    tl.store(
+                        dst + MAIN_V_OFF + dims,
+                        _quant_store(
+                            dst, v_f, 1.0 / v_scale, QUANT_MIN, QUANT_MAX
+                        ),
+                    )
+                else:
+                    _store_rotated(dst, y, o1, o2, main_k_scale)
+                    tl.store(
+                        dst + MAIN_V_OFF + dims,
+                        _to_dst_dtype(v, dst, main_v_scale),
+                    )
         else:
             out = (token * MAIN_HQ + head) * MAIN_D
             _store_rotated(main_q_out_ptr + out, y, o1, o2, None)
@@ -530,14 +621,30 @@ def qsa_prepare(
     main_slot_mapping: torch.Tensor,
     main_k_scale: float,
     main_v_scale: float,
+    main_k_scale_cache: torch.Tensor | None = None,
+    main_v_scale_cache: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Normalize Q, compress K, then update the circular raw state.
 
     Also prepares the main attention (QK-norm/RoPE, gate copy, K/V cache write)
     and returns its Q and gate.
+
+    For a per-(token, head) quantized cache the page packs an fp32 scale after
+    each head's data (see the backend's ``customize_spec``), so the content half
+    is ``head_dim + scale_pad``. Pass ``main_k_scale_cache``/``main_v_scale_cache``
+    (the strided float32 views carved over that padding) to select the fused
+    quantizing store; the head dim is then recovered from the padded width.
     """
     num_tokens = q.shape[0]
-    main_head_dim = main_kv_cache.shape[-1] // 2
+    padded_hs = main_kv_cache.shape[-1] // 2
+    quant = main_k_scale_cache is not None
+    if quant:
+        from vllm.utils.torch_utils import get_dtype_size
+
+        scale_pad = get_dtype_size(torch.float32) // main_kv_cache.element_size()
+    else:
+        scale_pad = 0
+    main_head_dim = padded_hs - scale_pad
     num_main_kv_heads = main_kv_cache.shape[2]
     num_main_q_heads = main_qkv.shape[1] // (2 * main_head_dim) - num_main_kv_heads
     main_q_out = main_qkv.new_empty(num_tokens, num_main_q_heads, main_head_dim)
@@ -638,10 +745,26 @@ def qsa_prepare(
         main_slots_ptr=main_slot_mapping,
         main_k_scale=main_k_scale,
         main_v_scale=main_v_scale,
+        main_k_scale_cache_ptr=main_k_scale_cache
+        if quant
+        else main_q_out,
+        main_v_scale_cache_ptr=main_v_scale_cache
+        if quant
+        else main_q_out,
+        ks_stride_block=main_k_scale_cache.stride(0) if quant else 0,
+        ks_stride_slot=main_k_scale_cache.stride(1) if quant else 0,
+        ks_stride_head=main_k_scale_cache.stride(2) if quant else 0,
+        vs_stride_block=main_v_scale_cache.stride(0) if quant else 0,
+        vs_stride_slot=main_v_scale_cache.stride(1) if quant else 0,
+        vs_stride_head=main_v_scale_cache.stride(2) if quant else 0,
         MAIN_HQ=num_main_q_heads,
         MAIN_HK=num_main_kv_heads,
         MAIN_D=main_head_dim,
         MAIN_PAGE_SIZE=main_kv_cache.shape[1],
+        MAIN_V_OFF=padded_hs,
+        QUANT=quant,
+        QUANT_MIN=-128.0 if quant else 0.0,
+        QUANT_MAX=127.0 if quant else 0.0,
         num_warps=1,
     )
     return main_q_out, main_gate_out
