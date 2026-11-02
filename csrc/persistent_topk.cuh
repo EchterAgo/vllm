@@ -267,10 +267,17 @@ __device__ __noinline__ overflow::MediumResume histogram_medium_topk(
     }
   }
   const int tie_slots = remaining_k;
+  // The refine passes narrow only bits 0-23 (bit_offset 16/8/0); bits 24-31
+  // are the coarse bin itself. Rebuild the full 32-bit ordered key of the
+  // k-th value so the sweep's > / == comparisons are against the real pivot:
+  // comparing the 24-bit exact_thr against a 32-bit element key makes every
+  // element of the threshold bin look "greater" (its high bits are set), so
+  // the boundary bin would be filled by ascending index rather than by value.
+  const uint32_t full_pivot = exact_thr | (uthr << 21);
 
   // Index-ordered selection sweep: a coarse bin above the threshold is
-  // definite; within the threshold bin, key > exact_thr is definite and the
-  // first tie_slots keys == exact_thr fill the rest. Positions come from
+  // definite; within the threshold bin, key > full_pivot is definite and the
+  // first tie_slots keys == full_pivot fill the rest. Positions come from
   // per-iteration block prefix scans, so output is ascending index order.
   int* warp_sums = &buffered_indices[0][0];  // scratch; buffer unused now
   if (thread_id == 0) {
@@ -290,9 +297,9 @@ __device__ __noinline__ overflow::MediumResume histogram_medium_topk(
       if (bin > uthr) {
         is_def = true;
       } else if (bin == uthr && tie_slots > 0) {
-        if (ordered > exact_thr) {
+        if (ordered > full_pivot) {
           is_def = true;
-        } else if (ordered == exact_thr) {
+        } else if (ordered == full_pivot) {
           is_tie = true;
         }
       }
