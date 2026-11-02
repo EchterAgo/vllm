@@ -10,7 +10,7 @@ look their params up.
 
 import torch
 
-from vllm.models.glm5next.nvidia.model import (
+from vllm.models.glm5next.common.model import (
     _try_load_fp8_attn_proj,
     _try_load_fp8_indexer_wk,
 )

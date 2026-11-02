@@ -441,16 +441,29 @@ def test_triton_mapping_matches_cpu(per_req, own_blocks, num_actual, padded_len)
     bt = make_tail_block_table(own_blocks)
 
     ref = compute_kpool_tail_slot_mapping(
-        slot_mapping, bt, qsl, positions, num_actual, num_reqs, ring_size
+        slot_mapping,
+        bt,
+        qsl,
+        positions,
+        num_actual,
+        num_reqs,
+        ring_size,
+        out_full=torch.full(
+            (padded_len,), -1, dtype=torch.int64, device=slot_mapping.device
+        ),
     )
+    cuda_slot_mapping = slot_mapping.cuda()
     got = compute_kpool_tail_slot_mapping(
-        slot_mapping.cuda(),
+        cuda_slot_mapping,
         bt.cuda(),
         qsl.cuda().to(torch.int32),
         positions.cuda(),
         num_actual,
         num_reqs,
         ring_size,
+        out_full=torch.full(
+            (padded_len,), -1, dtype=torch.int64, device=cuda_slot_mapping.device
+        ),
     )
     torch.testing.assert_close(got.cpu(), ref)
     for req, blk in enumerate(own_blocks):
