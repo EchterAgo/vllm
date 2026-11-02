@@ -149,15 +149,23 @@ def record_broadcasts(monkeypatch, fill_value: int | None = None) -> list:
     return calls
 
 
-def make_input_batch(num_reqs: int = 3, *, needs_sample: bool = True):
-    # compute_need_sampled_mask only reads the three numpy fields. With
+def make_input_batch(
+    num_reqs: int = 3, *, needs_sample: bool = True, num_draft_tokens: int = 0
+):
+    # compute_need_sampled_mask only reads these numpy fields. With
     # needs_sample=False every request is a non-final prefill chunk, so no
-    # sample is produced this step.
+    # sample is produced this step. max_seq_len_np=None disables the
+    # length-cap exclusion, which these cases do not exercise.
+    # num_draft_tokens selects the sampled-token broadcast width in
+    # _sample_len (0 -> 1, else max_sample_len).
     return SimpleNamespace(
         num_reqs=num_reqs,
+        num_draft_tokens=num_draft_tokens,
         num_computed_tokens_np=np.zeros(num_reqs, dtype=np.int32),
         prefill_len_np=np.full(num_reqs, 4 if needs_sample else 4096, dtype=np.int32),
         num_scheduled_tokens=np.full(num_reqs, 4, dtype=np.int32),
+        max_seq_len_np=None,
+        is_prefilling_np=np.ones(num_reqs, dtype=bool),
         idx_mapping=torch.arange(num_reqs, dtype=torch.int64, device="cuda"),
         idx_mapping_np=np.arange(num_reqs, dtype=np.intp),
     )
@@ -173,44 +181,64 @@ def send_step(handler, input_batch, *, width: int, with_draft: bool):
         draft_tokens = torch.zeros(
             8, handler.num_speculative_steps, dtype=torch.int64, device="cuda"
         )
-        handler.broadcast_drafts(draft_tokens, input_batch)
+        handler.broadcast_drafts(draft_tokens)
 
 
 @requires_cuda
-@pytest.mark.parametrize("width,num_spec", [(1, 1), (1, 3), (2, 3)])
-def test_broadcast_pads_sampled_tokens_to_max_sample_len(monkeypatch, width, num_spec):
-    """The sampler emits width 1 on steps with no draft tokens (prefill, first
-    decode) and num_spec+1 only after rejection sampling. The receiver always
-    posts a max_sample_len buffer, so an unpadded send is a count mismatch."""
+@pytest.mark.parametrize("width,num_spec", [(1, 1), (1, 3), (4, 3)])
+def test_broadcast_width_follows_num_draft_tokens(monkeypatch, width, num_spec):
+    """The sender and every receiver must agree on the sampled-token width.
+
+    The sampler emits width 1 on steps with no draft tokens (prefill, first
+    decode) and num_spec+1 only after rejection sampling, while `_sample_len`
+    derives the same width from `input_batch.num_draft_tokens`. A mismatch is
+    a collective count mismatch, so the sender asserts on it.
+    """
     handler = make_handler(
         monkeypatch, is_last_rank=True, num_speculative_steps=num_spec
     )
     calls = record_broadcasts(monkeypatch)
-    input_batch = make_input_batch()
+    # num_draft_tokens > 0 selects max_sample_len, 0 selects width 1.
+    input_batch = make_input_batch(num_draft_tokens=0 if width == 1 else num_spec)
+    assert handler._sample_len(input_batch) == width
 
     send_step(handler, input_batch, width=width, with_draft=False)
 
     sent_sampled = calls[0]
-    assert sent_sampled.shape == (input_batch.num_reqs, handler.max_sample_len)
-    # The real columns come first; the padding columns are ignored by
-    # post_update, which advances each request by its own num_sampled count.
-    assert (sent_sampled[:, :width] == 0).all()
+    assert sent_sampled.shape == (input_batch.num_reqs, width)
+    assert (sent_sampled == 0).all()
+
+    # A width that disagrees with the receiver's buffer must fail loudly
+    # rather than silently truncate the broadcast.
+    bad_width = 2 if width == 1 else 1
+    with pytest.raises(AssertionError):
+        send_step(
+            handler,
+            input_batch,
+            width=bad_width,
+            with_draft=False,
+        )
 
 
 @requires_cuda
 def test_send_and_recv_op_counts_match_with_speculator(monkeypatch):
     """With a speculator the step is three broadcasts: sampled, combined, draft,
     matched strictly by order on the communicator."""
+    # Draft tokens are in flight, so the sampled broadcast carries
+    # max_sample_len columns on both sides.
+    batch = make_input_batch(num_draft_tokens=3)
     sender = make_handler(monkeypatch, is_last_rank=True, num_speculative_steps=3)
     calls = record_broadcasts(monkeypatch)
-    send_step(sender, make_input_batch(), width=1, with_draft=True)
+    send_step(sender, batch, width=sender.max_sample_len, with_draft=True)
     assert len(calls) == 3
     assert calls[0].shape == (3, sender.max_sample_len)
-    assert calls[2].shape == (3, sender.num_speculative_steps)
+    # broadcast_drafts relays the runner's persistent [max_num_reqs, num_spec]
+    # table, not a per-step [num_reqs, num_spec] view.
+    assert calls[2].shape == (8, sender.num_speculative_steps)
 
     receiver = make_handler(monkeypatch, is_last_rank=False, num_speculative_steps=3)
     calls.clear()
-    assert receiver.receive(make_input_batch())
+    assert receiver.receive(batch, recv_drafts=True)
     assert len(calls) == 3
     assert calls[0].shape == (3, sender.max_sample_len)
     assert calls[2].shape == (3, sender.num_speculative_steps)
@@ -226,7 +254,7 @@ def test_send_and_recv_op_counts_match_without_speculator(monkeypatch):
 
     receiver = make_handler(monkeypatch, is_last_rank=False, num_speculative_steps=0)
     calls.clear()
-    assert receiver.receive(make_input_batch())
+    assert receiver.receive(make_input_batch(), recv_drafts=False)
     assert len(calls) == 2
     assert receiver.queue[-1].draft_tokens is None
 
@@ -241,33 +269,34 @@ def test_both_ranks_skip_when_no_request_needs_sampling(monkeypatch):
 
     receiver = make_handler(monkeypatch, is_last_rank=False, num_speculative_steps=3)
     calls.clear()
-    assert not receiver.receive(make_input_batch(needs_sample=False))
+    assert not receiver.receive(make_input_batch(needs_sample=False), recv_drafts=True)
     assert calls == []
 
 
 @requires_cuda
-def test_relayed_draft_tokens_are_scattered_on_consume(monkeypatch):
+def test_relayed_draft_tokens_are_returned_on_consume(monkeypatch):
     """Non-last ranks verify against req_states.draft_tokens, which only the
-    last rank can compute. The relayed drafts must land in that table when the
-    deferred entry is consumed pp_size steps later, or the earlier stages verify
+    last rank can compute. The relayed drafts must come back with the deferred
+    entry when it is consumed pp_size steps later, or the earlier stages verify
     against a zero-initialised table (near-zero acceptance, corrupt output)."""
     receiver = make_handler(
         monkeypatch, is_last_rank=False, num_speculative_steps=3, world_size=2
     )
     record_broadcasts(monkeypatch, fill_value=7)
     input_batch = make_input_batch(num_reqs=2)
-    assert receiver.receive(input_batch)
+    assert receiver.receive(input_batch, recv_drafts=True)
 
-    draft_tokens = torch.zeros(8, 3, dtype=torch.int64, device="cuda")
     # The queue is pre-seeded with pp_size placeholders: the first consume is
     # a no-op, the second returns the entry pushed above.
-    assert receiver.get_prev_sampled_outputs(draft_tokens) is None
-    outputs = receiver.get_prev_sampled_outputs(draft_tokens)
-    torch.cuda.synchronize()
-
+    assert receiver.get_prev_sampled_outputs() is None
+    outputs = receiver.get_prev_sampled_outputs()
     assert outputs is not None
-    assert (draft_tokens[:2] == 7).all()
-    assert (draft_tokens[2:] == 0).all()
+
+    draft_tokens = outputs["draft_tokens"]
+    assert draft_tokens is not None
+    torch.cuda.synchronize()
+    assert draft_tokens.shape == (2, receiver.num_speculative_steps)
+    assert (draft_tokens == 7).all()
     assert (outputs["sampled_tokens"] == 7).all()
 
 
