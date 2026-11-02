@@ -446,7 +446,6 @@ def _dequantize_and_gather_k_one_pass_kernel(
     block_stride: tl.constexpr,  # total bytes per block (padded) int32
     output_dim: tl.constexpr,  # 512
     fp8_max: tl.constexpr,
-    n_quant_blocks: tl.constexpr,  # 7 real blocks; the per-block form only
     use_fnuz: tl.constexpr = False,
 ):
     """``_dequantize_and_gather_k_kernel`` with the token read in one tile.
@@ -724,12 +723,32 @@ def dequantize_and_gather_k_cache_triton(
     TOKEN_DATA_SIZE = TOKEN_FP8_DIM + TOKEN_BF16_DIM * 2
 
     gather_workers = gather_num_workers(max_gather_len)
-    kernel = (
-        _dequantize_and_gather_k_one_pass_kernel
-        if current_platform.is_rocm()
-        else _dequantize_and_gather_k_kernel
-    )
-    kernel[(num_reqs, gather_workers)](
+    if current_platform.is_rocm():
+        # The one-pass form derives its tile from scale_dim * quant_block, so
+        # it takes neither fp8_block nor n_quant_blocks.
+        _dequantize_and_gather_k_one_pass_kernel[(num_reqs, gather_workers)](
+            out,
+            out.stride(0),
+            out.stride(1),
+            k_cache,
+            seq_lens,
+            block_table,
+            offset,
+            gather_lens,
+            max_blocks_per_seq=block_table.shape[-1],
+            fp8_dim=TOKEN_FP8_DIM,
+            bf16_dim=TOKEN_BF16_DIM,
+            scale_dim=TOKEN_SCALE_DIM,
+            quant_block=QUANT_BLOCK_SIZE,
+            cache_block_size=block_size,
+            token_data_size=TOKEN_DATA_SIZE,
+            block_stride=k_cache.stride(0),
+            output_dim=512,
+            fp8_max=FP8_MAX,
+            use_fnuz=use_fnuz,
+        )
+        return
+    _dequantize_and_gather_k_kernel[(num_reqs, gather_workers)](
         out,
         out.stride(0),
         out.stride(1),
