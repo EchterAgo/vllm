@@ -420,38 +420,73 @@ __device__ __forceinline__ bool exact_topk_refine_registers(
     __syncthreads();
   }
 
+  // Deterministic index-ordered emit (see #50576). The historical scatter
+  // claimed output slots FCFS via atomicAdd: the definite block's ORDER and,
+  // when exact-value ties straddle the k boundary, the selected SET depended
+  // on warp scheduling. ReLU'd indexer scores make that tie mass the common
+  // case (this overflow path fires whenever num_equal > TopK), so temp=0
+  // decoding was non-reproducible. Emit the selected set -- keys > pivot, plus
+  // the first tie_slots keys == pivot in ascending index order -- in ascending
+  // index order, using the same packed (definite<<16 | tie) block scan as
+  // histogram_4096_topk's Phase 4 / topk_histogram_4096::index_order_scatter,
+  // over the register values (no global rescan).
+  const uint32_t pivot = base_key + smem->prefix;
+  const uint32_t tie_slots = smem->remaining;
+  const uint32_t lane = tx % kWarpSize;
+  const uint32_t warp = tx / kWarpSize;
+  uint32_t* warp_sums = smem->histogram;  // free after the refine rounds
   if (tx == 0) {
-    smem->output_counter = 0;
-    smem->equal_counter = 0;
+    smem->output_counter = 0;  // running definite count
+    smem->equal_counter = 0;   // running tie count
   }
   __syncthreads();
-
-  const uint32_t pivot = base_key + smem->prefix;
-  const uint32_t equal_base = TopK - smem->remaining;
-  bool done = false;
 #pragma unroll
-  for (uint32_t v = 0; v < VecsPerThread && !done; ++v) {
+  for (uint32_t v = 0; v < VecsPerThread; ++v) {
     const float* values = reinterpret_cast<const float*>(&vecs[v]);
+    uint32_t def_bits = 0, tie_bits = 0;
 #pragma unroll
-    for (uint32_t e = 0; e < 4 && !done; ++e) {
+    for (uint32_t e = 0; e < 4; ++e) {
       const uint32_t idx = (tx + v * kBlockSize) * 4 + e;
-      if (idx >= length) {
-        done = true;
-      } else {
-        const uint32_t key = convert_to_uint32_v2(values[e]);
-        if (key > pivot) {
-          const uint32_t pos = atomicAdd(&smem->output_counter, 1);
-          output[pos] = static_cast<int32_t>(idx);
-        } else if (key == pivot) {
-          const uint32_t pos = atomicAdd(&smem->equal_counter, 1);
-          if (equal_base + pos < TopK) {
-            output[equal_base + pos] = static_cast<int32_t>(idx);
-          }
-        }
+      if (idx >= length) continue;
+      const uint32_t key = convert_to_uint32_v2(values[e]);
+      if (key > pivot) {
+        def_bits |= 1u << e;
+      } else if (key == pivot) {
+        tie_bits |= 1u << e;
       }
     }
+    const uint32_t packed = (static_cast<uint32_t>(__popc(def_bits)) << 16) |
+                            static_cast<uint32_t>(__popc(tie_bits));
+    const uint32_t winc = warp_inclusive_sum(lane, packed);
+    if (lane == kWarpSize - 1) warp_sums[warp] = winc;
+    __syncthreads();
+    const uint32_t wtmp = warp_sums[lane];
+    const uint32_t iter_total = warp_reduce_sum_full(wtmp);
+    const uint32_t inter_prefix = warp_reduce_sum_full(lane < warp ? wtmp : 0);
+    const uint32_t thread_excl = inter_prefix + (winc - packed);
+    uint32_t def_prefix = smem->output_counter + (thread_excl >> 16);
+    uint32_t tie_prefix = smem->equal_counter + (thread_excl & 0xFFFF);
+#pragma unroll
+    for (uint32_t e = 0; e < 4; ++e) {
+      const uint32_t idx = (tx + v * kBlockSize) * 4 + e;
+      if (def_bits & (1u << e)) {
+        output[def_prefix + min(tie_prefix, tie_slots)] =
+            static_cast<int32_t>(idx);
+        def_prefix++;
+      } else if (tie_bits & (1u << e)) {
+        if (tie_prefix < tie_slots) {
+          output[def_prefix + tie_prefix] = static_cast<int32_t>(idx);
+        }
+        tie_prefix++;
+      }
+    }
+    __syncthreads();
+    if (tx == 0) {
+      smem->output_counter += iter_total >> 16;
+      smem->equal_counter += iter_total & 0xFFFF;
+    }
+    __syncthreads();
   }
-  __syncthreads();
   return true;
 }
 
