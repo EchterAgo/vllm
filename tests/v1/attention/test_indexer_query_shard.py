@@ -54,6 +54,9 @@ def _chunk(
         cu_seq_lens=none,
         token_to_seq=none,
         total_seq_lens=token_end - token_start,
+        # The Q-path row ranges under test never read this; it only sizes the
+        # DeepGEMM prefill logits in the real builder.
+        max_seqlen_k=token_end - token_start,
         token_start=token_start,
         token_end=token_end,
         num_reqs=1,
