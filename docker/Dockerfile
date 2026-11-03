@@ -663,6 +663,26 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 # when the wheel changes, without copying the wheel itself into the image.
 RUN sha256sum dist/*.whl > dist/wheel.sha256
 
+# Build the optional Ampere (sm_80) native extensions with the standalone
+# scripts (not the core CMake build): they are arch-specific, env-gated and
+# soft-loaded, so they stay out of the shared wheel. Each compiles for sm_80
+# against this stage's torch and lands a .abi3.so in a staging dir; the
+# vllm-base stage copies it next to the Python module that import_module()s it.
+# Ampere Marlin MoE decode/prefill:
+# vllm/model_executor/layers/fused_moe/experts/ampere_marlin/_ampere_marlin_C.abi3.so.
+# Gated at runtime by VLLM_AMPERE_MARLIN_DECODE_CUDA; vLLM runs without it.
+ARG VLLM_BUILD_AMPERE_MARLIN=true
+RUN --mount=type=cache,target=/root/.cache/torch_extensions \
+    set -e; \
+    mkdir -p /workspace/ampere-exts; \
+    if [ "${vllm_target_device}" = "cuda" ] && [ "${VLLM_BUILD_AMPERE_MARLIN}" = "true" ]; then \
+        echo "Building _ampere_marlin_C (sm_80)..." && \
+        mkdir -p /workspace/ampere-exts/ampere_marlin && \
+        VLLM_AMPERE_MARLIN_BUILD=1 python3 csrc/ampere_marlin/build_standalone.py \
+            --out /workspace/ampere-exts/ampere_marlin \
+            --build-dir /root/.cache/torch_extensions/ampere_marlin; \
+    else echo "Skipping _ampere_marlin_C"; fi
+
 # Copy extension wheels from extensions-build stage for later use
 COPY --from=extensions-build /tmp/ep_kernels_workspace/dist /tmp/ep_kernels_workspace/dist
 
@@ -1051,6 +1071,19 @@ RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist
         && uv pip install --system dist/*.whl --verbose \
         --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
     fi
+
+# Place the optional Ampere (sm_80) native extensions built in the `build`
+# stage next to the Python modules that soft-load them by path. Absent when the
+# build args are off or the target is not CUDA; the loaders then fall back to
+# upstream kernels. The .so must match this image's torch (built in `build`).
+COPY --from=build /workspace/ampere-exts /tmp/ampere-exts
+# Ampere Marlin MoE decode/prefill kernels (gated by VLLM_AMPERE_MARLIN_DECODE_CUDA).
+RUN set -e; \
+    PLATLIB="$(python3 -c 'import sysconfig; print(sysconfig.get_path("platlib"))')"; \
+    src=/tmp/ampere-exts/ampere_marlin/_ampere_marlin_C.abi3.so; \
+    dst="$PLATLIB/vllm/model_executor/layers/fused_moe/experts/ampere_marlin"; \
+    if [ -f "$src" ]; then mkdir -p "$dst" && cp "$src" "$dst/" && echo "installed $dst/_ampere_marlin_C.abi3.so"; else echo "skipped _ampere_marlin_C (not built)"; fi; \
+    rm -rf /tmp/ampere-exts
 
 # Expose the Rust frontend bundled in the wheel on the container's PATH.
 RUN ln -s "$(python3 -c 'import sysconfig; print(sysconfig.get_path("platlib"))')/vllm/vllm-rs" /usr/local/bin/vllm-rs \
