@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 import itertools
 import time
 from collections import defaultdict, deque
@@ -32,6 +33,7 @@ from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.inputs import MultiModalKwargsItem
 from vllm.multimodal.utils import get_mm_features_in_window
 from vllm.outputs import RequestError
+from vllm.v1.core.sched.ampere.hooks import failed_inputs, mamba_block_size, sm80_step
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
@@ -320,6 +322,9 @@ class Scheduler(SchedulerInterface):
             self.num_lookahead_tokens > 0 and vllm_config.use_v2_model_runner
         )
         self.dynamic_sd_lookup: list[int] | None = None
+        # Per-step verify / draft widths; the fork scheduler's adaptive k sets them.
+        self.cur_num_spec_tokens = self.num_spec_tokens
+        self.next_num_spec_tokens = self.num_spec_tokens
         if speculative_config is not None:
             if speculative_config.num_speculative_tokens_per_batch_size:
                 self.dynamic_sd_lookup = build_dynamic_sd_schedule_lookup(
@@ -572,6 +577,7 @@ class Scheduler(SchedulerInterface):
         num_new_tokens: int,
         num_new_local_computed_tokens: int = 0,
         num_external_computed_tokens: int = 0,
+        prefill_limit: int | None = None,
     ) -> int:
         """Clip a prefill chunk so it ends where Mamba state must be cached.
 
@@ -595,11 +601,7 @@ class Scheduler(SchedulerInterface):
         # Chunk ends are what the worker checkpoints a mamba state at, so the
         # stops follow the mamba group's own grid, not the generic group
         # minimum (see `mamba_state_block_size` in `__init__`).
-        block_size = (
-            self.mamba_state_block_size
-            if self.mamba_state_block_size is not None
-            else self.cache_config.block_size
-        )
+        block_size = mamba_block_size(self)
         # The last block-aligned position whose state can be cached. With
         # Eagle, FullAttn prunes the last matching block, so back off one
         # block to avoid a Mamba cache miss.
@@ -644,6 +646,8 @@ class Scheduler(SchedulerInterface):
             long_prefill_threshold = self.scheduler_config.long_prefill_token_threshold
             if long_prefill_threshold > 0:
                 max_prefill_tokens = min(max_prefill_tokens, long_prefill_threshold)
+            if prefill_limit is not None:
+                max_prefill_tokens = prefill_limit
             aligned_end = end // block_size * block_size
             if aligned_end > start or block_size <= max_prefill_tokens:
                 end = aligned_end
@@ -828,6 +832,7 @@ class Scheduler(SchedulerInterface):
         ):
             defer_prefills = True
 
+        sm80 = sm80_step(self, token_budget, draft_slots, long_prefill_token_threshold)
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -856,6 +861,9 @@ class Scheduler(SchedulerInterface):
                 # to match worker-side sampled-tokens broadcast slot ring cadence.
                 req_index += 1
                 continue
+            if sm80.skip(request):
+                req_index += 1
+                continue
 
             if defer_prefills and request.is_prefill_chunk:
                 # DP prefill balancing: defer this in-progress prefill chunk to a
@@ -881,6 +889,7 @@ class Scheduler(SchedulerInterface):
             )
             if 0 < long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = long_prefill_token_threshold
+            num_new_tokens = sm80.cap(request, num_new_tokens)
             num_new_tokens = min(
                 num_new_tokens, token_budget, input_budget - draft_slots
             )
@@ -897,7 +906,7 @@ class Scheduler(SchedulerInterface):
             # Apply Mamba alignment before encoder caps.
             if self.need_mamba_block_aligned_split:
                 num_new_tokens = self._mamba_block_aligned_split(
-                    request, num_new_tokens
+                    request, num_new_tokens, 0, 0, sm80.ceil(token_budget, input_budget)
                 )
 
             # Schedule encoder inputs.
@@ -991,6 +1000,7 @@ class Scheduler(SchedulerInterface):
                             restored = num_scheduled_tokens.pop(preempted_req_id)
                             token_budget += restored
                             input_budget += restored + draft_slots
+                            sm80.refund(preempted_req, restored)
                             req_to_new_blocks.pop(preempted_req_id)
                             scheduled_spec_decode_tokens.pop(preempted_req_id, None)
                             preempted_encoder_inputs = scheduled_encoder_inputs.pop(
@@ -1039,6 +1049,7 @@ class Scheduler(SchedulerInterface):
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
             input_budget -= num_new_tokens + draft_slots
+            sm80.charge(request, num_new_tokens)
             req_index += 1
             drafts_needed = drafts_needed or not self._drafts_unused(
                 request, request.num_computed_tokens, num_new_tokens
@@ -1352,8 +1363,9 @@ class Scheduler(SchedulerInterface):
                         and num_new_tokens == 1
                         and not prefill_scheduled
                         and (scheduled_running_reqs or num_computed_tokens > 0)
+                        and not sm80.prompt_tail(request, num_computed_tokens)
                     ):
-                        padded_num_tokens = 1 + self.num_spec_tokens
+                        padded_num_tokens = 1 + self.cur_num_spec_tokens
                         # Pad only when there is room for the sampled token(s).
                         if (
                             num_computed_tokens
@@ -1369,6 +1381,11 @@ class Scheduler(SchedulerInterface):
 
                     if 0 < long_prefill_token_threshold < num_new_tokens:
                         num_new_tokens = long_prefill_token_threshold
+                    num_new_tokens = sm80.admit(
+                        request, num_computed_tokens, num_new_tokens
+                    )
+                    if not num_new_tokens:
+                        break
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
@@ -1391,12 +1408,13 @@ class Scheduler(SchedulerInterface):
                             num_new_tokens,
                             num_new_local_computed_tokens,
                             num_external_computed_tokens,
+                            sm80.ceil(token_budget, input_budget),
                         )
                         if num_new_tokens == 0:
                             break
                         if (
                             pad_spec_decode
-                            and num_new_tokens != 1 + self.num_spec_tokens
+                            and num_new_tokens != 1 + self.cur_num_spec_tokens
                         ):
                             # Alignment clipped the placeholder rows. The split
                             # aligns prefill chunks, but the padded tail rows are
@@ -1607,6 +1625,7 @@ class Scheduler(SchedulerInterface):
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
                 input_budget -= num_new_tokens + draft_slots
+                sm80.charge(request, num_new_tokens)
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 self._set_kv_fetch_stage(request, None)
@@ -1614,10 +1633,10 @@ class Scheduler(SchedulerInterface):
                     request, num_computed_tokens, num_new_tokens
                 )
                 if pad_spec_decode:
-                    assert num_new_tokens == 1 + self.num_spec_tokens
+                    assert num_new_tokens == 1 + self.cur_num_spec_tokens
                     scheduled_spec_decode_tokens[request_id] = [
                         -1
-                    ] * self.num_spec_tokens
+                    ] * self.cur_num_spec_tokens
                 # Must use the SAME predicate as the deferral gate in the
                 # waiting loop (`num_computed_tokens < num_tokens - 1`).
                 # Stamping on `< num_prompt_tokens` instead let a request with
@@ -1668,6 +1687,7 @@ class Scheduler(SchedulerInterface):
 
         assert token_budget >= 0
         assert input_budget >= 0
+        sm80.finish(total_num_scheduled_tokens, num_scheduled_tokens)
         assert len(self.running) <= self.max_num_running_reqs
         # Since some requests in the RUNNING queue may not be scheduled in
         # this step, the total number of scheduled requests can be smaller than
@@ -1745,7 +1765,7 @@ class Scheduler(SchedulerInterface):
         pending_kv_cache_block_copies = kv_cache_block_copies or None
 
         # Dynamic speculative decoding: compute optimal K
-        num_spec_tokens_to_schedule = self.num_spec_tokens
+        num_spec_tokens_to_schedule = self.next_num_spec_tokens
         if self.dynamic_sd_lookup is not None and len(num_scheduled_tokens) > 0:
             num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
                 len(num_scheduled_tokens)
@@ -2366,6 +2386,7 @@ class Scheduler(SchedulerInterface):
                     num_scheduled_tokens,
                 )
             )
+        failed_input_req_ids = failed_inputs(self, model_runner_output)
         # NOTE(woosuk): As len(num_scheduled_tokens) can be up to 1K or more,
         # the below loop can be a performance bottleneck. We should do our best
         # to avoid expensive operations inside the loop.
@@ -2386,6 +2407,8 @@ class Scheduler(SchedulerInterface):
                     assert request.num_stale_output_tokens >= 0
             if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
                 # skip failed or rescheduled requests from KV load failure
+                continue
+            if failed_input_req_ids and req_id in failed_input_req_ids:
                 continue
             if request is None or request.is_finished():
                 # The request is already finished. This can happen if the
@@ -2624,6 +2647,7 @@ class Scheduler(SchedulerInterface):
         self.encoder_cache_mismatch_reqs.clear()
         if failed_kv_load_req_ids and not self.recompute_kv_load_failures:
             error_req_ids.update(failed_kv_load_req_ids)
+        error_req_ids.update(failed_input_req_ids)
         if self.ec_connector is not None:
             # An encoder input the connector can no longer obtain. Failing is
             # retryable: re-issuing the request re-runs the encode.

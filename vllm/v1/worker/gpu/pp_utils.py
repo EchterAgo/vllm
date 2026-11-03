@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 """Pipeline Parallelism utils for V2 Model Runner."""
 
 from collections import deque
@@ -14,6 +15,7 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.worker.gpu.ampere import pp_hooks as sm80_pp
 
 
 @dataclass
@@ -131,6 +133,12 @@ class PPHandler:
     def get_prev_sampled_outputs(self) -> dict[str, torch.Tensor | None] | None:
         """Consume the entry from pp_size steps ago and wait for its recv event,
         then filter out entries whose request was freed since `receive`.
+
+        Besides the postprocess_sampled arguments, the dict carries
+        ``step_idx_mapping``: that step's unfiltered batch -> request mapping,
+        from which the caller can rebuild the step's batch-order block tables
+        (batch-indexed consumers such as the mamba align postprocess must not
+        read the rows of a later step's batch).
         """
         if not self.queue:
             return None
@@ -160,6 +168,7 @@ class PPHandler:
             num_rejected=slot.num_rejected,
             idx_mapping=idx_mapping,
             draft_tokens=slot.draft_tokens,
+            step_idx_mapping=slot.idx_mapping,
         )
 
     def broadcast_drafts(self, draft_tokens: torch.Tensor) -> None:
@@ -207,7 +216,9 @@ class PPHandler:
                     num_reqs, self.num_speculative_steps
                 )
                 torch.distributed.broadcast(
-                    draft_tokens, src=self.last_rank, group=self.broadcast_group
+                    draft_tokens,
+                    src=sm80_pp.drafts_src(self, draft_tokens),
+                    group=self.broadcast_group,
                 )
             event = self.broadcast_stream.record_event()
             num_sampled, num_rejected = combined.unbind(dim=0)
