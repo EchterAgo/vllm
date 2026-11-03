@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 """Custom Sparse Attention Indexer layers."""
 
 import torch
@@ -29,6 +30,7 @@ from vllm.models.glm5next.common.sparse_indexer import (
     kv_cache_as_quant_view,
 )
 from vllm.models.glm5next.nvidia.ops import kpool_compress as kpool_ops
+from vllm.models.glm5next.ampere import sm80_indexer
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import (
     fp8_fp4_mqa_logits,
@@ -272,7 +274,14 @@ def sparse_attn_indexer_kpool(
                 "mxfp8" if mqa_logits_use_mx_scales() else scale_fmt,
             )
 
-    topk_indices_buffer[: hidden_states.shape[0]] = -1
+    fuse_tail = sm80_indexer.fill_topk_indices(
+        topk_indices_buffer[: hidden_states.shape[0]],
+        attn_metadata_narrowed,
+        positions,
+        index_kpool,
+        use_fp4_cache,
+        topk_tokens,
+    )
     if has_prefill:
         prefill_metadata = attn_metadata_narrowed.prefill
         assert prefill_metadata is not None
@@ -367,7 +376,15 @@ def sparse_attn_indexer_kpool(
             # DeepGEMM returns compressed logits: row i starts at K position
             # cu_seqlen_ks[i]; the Triton fallback is full-width.
             row_starts: torch.Tensor | None = None
-            if chunk.local_total_seq_lens == 0:
+            if sm80_indexer.triton_prefill_logits(chunk, use_fp4_cache, dcp_world_size):
+                logits, row_starts, row_ends = sm80_indexer.prefill_logits(
+                    q_slice_cast,
+                    (k_quant_cast, k_scale_cast),
+                    weights[row_start:row_end],
+                    cu_seqlen_ks,
+                    cu_seqlen_ke,
+                )
+            elif chunk.local_total_seq_lens == 0:
                 logits = q_slice.new_empty((num_rows, 0), dtype=torch.float32)
                 row_ends = torch.zeros(num_rows, dtype=torch.int32, device=q_slice.device)
             elif use_deep_gemm:
@@ -429,6 +446,7 @@ def sparse_attn_indexer_kpool(
                     logits.stride(1),
                     select_k,
                 )
+                sm80_indexer.prefill_topk_tiefix(logits, topk_dst, row_starts, row_ends)
             # Local pool ids -> request-relative global pool ids.
             _merge_dcp_topk_global(
                 logits,
@@ -439,6 +457,7 @@ def sparse_attn_indexer_kpool(
                 pool_cp_interleave,
                 row_starts=row_starts,
             )
+            del logits  # free the fp32 chunk logits before the next chunk's
 
             if index_kpool > 1:
                 pool_ids = pool_topk.to(torch.int64)
@@ -541,7 +560,8 @@ def sparse_attn_indexer_kpool(
                 dec_k = k[:num_decode_tokens].view(*shape2, head_dim)
                 dec_gate = gate_score[:num_decode_tokens].view(*shape2, head_dim)
                 dec_slot = slot_mapping[:num_decode_tokens].view(shape2)
-                dec_pos = positions[:num_decode_tokens].to(torch.int32).view(shape2)
+                dec_pos = sm80_indexer.decode_positions(positions, num_decode_tokens)
+                dec_pos = dec_pos.view(shape2)
             tail_meta = (
                 attn_metadata.get(_resolve_layer_name(tail_prefix))
                 if tail_prefix is not None
@@ -708,6 +728,7 @@ def sparse_attn_indexer_kpool(
             # passes logits.shape[1] here for the same reason.
             logits.shape[1],
         )
+        sm80_indexer.decode_topk_tiefix(logits, topk_dst, seq_lens, next_n)
         _merge_dcp_topk_global(
             logits,
             topk_dst,
@@ -718,6 +739,10 @@ def sparse_attn_indexer_kpool(
         )
 
         # Resolve to token-level indices in the output buffer.
+        if fuse_tail:
+            return sm80_indexer.expand_tail(
+                pool_topk, positions, topk_indices_buffer, hidden_states, index_kpool
+            )
         if index_kpool > 1:
             pool_ids = pool_topk.to(torch.int64)
             n = pool_topk.shape[0]

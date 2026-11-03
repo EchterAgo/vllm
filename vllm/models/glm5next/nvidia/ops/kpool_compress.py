@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 """kpool (key-pooling) Triton kernels for the sparse-attention indexer.
 
 The cache stores POOLS (1 entry per ``pool_size`` consecutive tokens) rather
@@ -24,6 +25,11 @@ from vllm.v1.attention.ops.fp8_sm80 import (
 
 # The GLM-5.3-Flash indexer head dimension is fixed at 128.
 INDEX_HEAD_DIM = 128
+
+# fp8 stores: Hopper+ writes through a float8_e4m3fn pointer (hardware cvt);
+# older devices (Triton rejects fp8e4nv below SM89) get the uint8 byte view of
+# the same tensor and convert in software (see triton_e4m3.py). The wrappers
+# pick the view; the kernels only see FP8_NATIVE.
 
 
 def _fp8_out(t: torch.Tensor) -> torch.Tensor:
@@ -384,16 +390,19 @@ def kpool_compress_and_write_cache(
     s_offset_nbytes_in_page = page_size * head_dim
 
     if return_compressed:
-        compressed_k = torch.empty(
+        compressed_k_out = torch.empty(
             (slot_k.shape[0], head_dim),
             dtype=torch.float8_e4m3fn,
             device=slot_k.device,
+        )
+        compressed_k = (
+            compressed_k_out if native else compressed_k_out.view(torch.uint8)
         )
         compressed_scale = torch.empty(
             (slot_k.shape[0],), dtype=torch.float32, device=slot_k.device
         )
     else:
-        compressed_k = buf_fp8
+        compressed_k_out = compressed_k = buf_fp8
         compressed_scale = buf_fp32
 
     _kpool_softmax_rotate_write_cache_kernel[(slot_k.shape[0],)](
@@ -427,7 +436,7 @@ def kpool_compress_and_write_cache(
     )
 
     if return_compressed:
-        return compressed_k, compressed_scale
+        return compressed_k_out, compressed_scale
     return None
 
 
@@ -526,7 +535,7 @@ def _kpool_decode_update_batched_kernel(
     ape_ptr,
     ape_stride_0,
     slot_mapping_ptr,  # [B, NEXT_N] int32
-    positions_ptr,  # [B, NEXT_N] int32
+    positions_ptr,  # [B, NEXT_N] int32 or int64 (truncated to int32 on load)
     NEXT_N,  # runtime token count per request (no .item() needed)
     PAGE_SIZE: tl.constexpr,
     BUF_NUMEL_PER_PAGE: tl.constexpr,
@@ -557,7 +566,9 @@ def _kpool_decode_update_batched_kernel(
     for t in tl.range(0, NEXT_N):
         idx = req * NEXT_N + t
         cache_loc = tl.load(slot_mapping_ptr + idx)
-        pos = tl.load(positions_ptr + idx)
+        # A no-op for int32 positions; for int64 it is the int32 cast the
+        # caller used to launch separately.
+        pos = tl.load(positions_ptr + idx).to(tl.int32)
         safe_pos = tl.maximum(pos, 0)
         pos_valid = (cache_loc >= 0) & (pos >= 0)
 
@@ -728,7 +739,7 @@ def kpool_decode_update_and_maybe_write_cache_batched(
         slot_score: ``[num_requests, next_n, head_dim]`` bf16.
         ape: ``[pool_size, head_dim]`` fp32.
         slot_mapping: ``[num_requests, next_n]`` int32.
-        positions: ``[num_requests, next_n]`` int32.
+        positions: ``[num_requests, next_n]`` int32 or int64.
         pool_size: Number of tokens compressed into one cache entry.
         head_dim: Indexer head dimension.
         round_scale: Round each fp8 scale down to a power of two.
