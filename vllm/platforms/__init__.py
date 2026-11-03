@@ -102,7 +102,14 @@ def cuda_platform_plugin() -> str | None:
         else:
             logger.debug("CUDA platform is not available because: %s", str(e))
 
-    return "vllm.platforms.cuda.CudaPlatform" if is_cuda else None
+    if not is_cuda:
+        return None
+    # The Ampere (sm_80) fork selects its CUDA platform subclass here instead
+    # of through an out-of-tree platform plugin (vllm.platforms.ampere adds the
+    # sm_80 sparse-MLA backend candidate and the PCIe-P2P allreduce routing).
+    from vllm.platforms.ampere import Sm80CudaPlatform
+
+    return f"{Sm80CudaPlatform.__module__}.{Sm80CudaPlatform.__qualname__}"
 
 
 def rocm_platform_plugin() -> str | None:
