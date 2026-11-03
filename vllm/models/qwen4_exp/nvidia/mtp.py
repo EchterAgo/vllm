@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 """Inference-only Qwen4Exp MTP (Multi-Token Predictor) model.
 
 The MTP draft model reuses the Qwen4Exp backbone (PLE/HC/MoE) but:
@@ -177,6 +178,11 @@ def _make_draft_vllm_config(
             draft_quant_config.ignore = ct_ignore + [
                 pattern for pattern in extra_ignores if pattern not in ct_ignore
             ]
+        # EXL3 draft configs carry the MTP start layer so the packed-weight
+        # layout can offset its draft layers; other quant configs are no-ops.
+        set_start = getattr(draft_quant_config, "set_mtp_start_layer_idx", None)
+        if set_start is not None:
+            set_start(mtp_start_layer_idx)
 
     draft_vllm_config = replace(
         vllm_config,
