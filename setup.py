@@ -1637,6 +1637,12 @@ package_data = {
         # Built-in multimodal chat template fallbacks (registry.py)
         "transformers_utils/chat_templates/*.jinja",
         "third_party/flash_linear_attention/LICENSE",
+        # Ampere (sm_80) fork: per-card tuning cut-off tables, loaded at
+        # import by vllm/utils/ampere_tuning.py via its package-relative
+        # TABLE_DIR; and the DSpark depth-policy reference file users point
+        # VLLM_DSPARK_ADAPTIVE_DEPTH at.
+        "utils/ampere_tuning/*.toml",
+        "models/deepseek_v41/ampere/*.json",
         # DeepGEMM JIT include headers (vendored via cmake)
         "third_party/deep_gemm/include/**/*.cuh",
         "third_party/deep_gemm/include/**/*.h",

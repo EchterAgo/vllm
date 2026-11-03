@@ -88,6 +88,13 @@ def load_general_plugins():
     # general plugins, we only need to execute the loaded functions
     for func in plugins.values():
         func()
+    # The Ampere (sm_80) fork registers inline rather than through a
+    # `vllm.general_plugins` entry point: models, drafters, MoE layers, the
+    # EXL3 quant+loader, the sparse-MLA backend, the mHC op and the fork
+    # parsers. Idempotent; runs in every process that loads general plugins.
+    from vllm.ampere_bootstrap import register as _register_ampere
+
+    _register_ampere()
 
 
 def load_endpoint_plugins(
