@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 import torch
 
+from vllm.model_executor.kernels.mhc import ampere as sm80_mhc
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -54,6 +56,8 @@ def _hc_prenorm_gemm_outputs(
     )
     if use_deep_gemm:
         tf32_hc_prenorm_gemm(x, fn, out, sqrsum, n_splits)
+    elif sm80_mhc.try_prenorm(x, fn, out, sqrsum, num_tokens):
+        pass
     elif n_splits == 1 and x.shape[0] < _PRENORM_SMALL_T and x.shape[1] % 1024 == 0:
         # Launch-latency regime: the fused tilelang kernel beats cuBLAS below
         # the measured crossover, and keeps fp32 `fn` numerics.
