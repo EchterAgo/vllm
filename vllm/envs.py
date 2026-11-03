@@ -2612,6 +2612,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ).upper(),
 }
 
+# The Ampere (sm_80 / CMP 170HX) fork's feature flags. Registered into the
+# table above at import, before any reader resolves a name through
+# __getattr__. Raises if upstream ever declares one of these names itself.
+#
+# setup.py loads this file standalone -- as the top-level module "envs", with
+# no package context (__package__ empty) -- to read the build-time flags,
+# before the vllm package is importable. The import below must not run then:
+# it would trigger `import vllm` -> vllm/__init__.py -> vllm.version, which the
+# minimal csrc-build image stage does not copy. Registering only when imported
+# as part of a package keeps that standalone load working while still
+# registering eagerly for every real `import vllm.envs`, which is what the
+# import-time readers rely on.
+if __package__:
+    from vllm.envs_ampere import (  # noqa: E402
+        register_env_vars as _register_ampere_env_vars,
+    )
+
+    _register_ampere_env_vars(environment_variables)
+
 
 # --8<-- [end:env-vars-definition]
 
