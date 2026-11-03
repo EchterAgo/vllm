@@ -668,13 +668,25 @@ RUN sha256sum dist/*.whl > dist/wheel.sha256
 # soft-loaded, so they stay out of the shared wheel. Each compiles for sm_80
 # against this stage's torch and lands a .abi3.so in a staging dir; the
 # vllm-base stage copies it next to the Python module that import_module()s it.
+# EXL3: vllm/model_executor/layers/quantization/exl3/_exl3_C.abi3.so. Only
+# needed to serve EXL3 checkpoints; our AWQ path does not load it.
+ARG VLLM_BUILD_EXL3=true
+RUN --mount=type=cache,target=/root/.cache/torch_extensions \
+    set -e; \
+    mkdir -p /workspace/ampere-exts; \
+    if [ "${vllm_target_device}" = "cuda" ] && [ "${VLLM_BUILD_EXL3}" = "true" ]; then \
+        echo "Building _exl3_C (sm_80)..." && \
+        mkdir -p /workspace/ampere-exts/exl3 && \
+        python3 csrc/exl3/build_standalone.py --out /workspace/ampere-exts/exl3 \
+            --build-dir /root/.cache/torch_extensions/exl3; \
+    else echo "Skipping _exl3_C"; fi
+
 # Ampere Marlin MoE decode/prefill:
 # vllm/model_executor/layers/fused_moe/experts/ampere_marlin/_ampere_marlin_C.abi3.so.
 # Gated at runtime by VLLM_AMPERE_MARLIN_DECODE_CUDA; vLLM runs without it.
 ARG VLLM_BUILD_AMPERE_MARLIN=true
 RUN --mount=type=cache,target=/root/.cache/torch_extensions \
     set -e; \
-    mkdir -p /workspace/ampere-exts; \
     if [ "${vllm_target_device}" = "cuda" ] && [ "${VLLM_BUILD_AMPERE_MARLIN}" = "true" ]; then \
         echo "Building _ampere_marlin_C (sm_80)..." && \
         mkdir -p /workspace/ampere-exts/ampere_marlin && \
@@ -1077,6 +1089,13 @@ RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist
 # build args are off or the target is not CUDA; the loaders then fall back to
 # upstream kernels. The .so must match this image's torch (built in `build`).
 COPY --from=build /workspace/ampere-exts /tmp/ampere-exts
+# EXL3 native kernels (only used when serving an EXL3 checkpoint).
+RUN set -e; \
+    PLATLIB="$(python3 -c 'import sysconfig; print(sysconfig.get_path("platlib"))')"; \
+    src=/tmp/ampere-exts/exl3/_exl3_C.abi3.so; \
+    dst="$PLATLIB/vllm/model_executor/layers/quantization/exl3"; \
+    if [ -f "$src" ]; then mkdir -p "$dst" && cp "$src" "$dst/" && echo "installed $dst/_exl3_C.abi3.so"; else echo "skipped _exl3_C (not built)"; fi
+
 # Ampere Marlin MoE decode/prefill kernels (gated by VLLM_AMPERE_MARLIN_DECODE_CUDA).
 RUN set -e; \
     PLATLIB="$(python3 -c 'import sysconfig; print(sysconfig.get_path("platlib"))')"; \
