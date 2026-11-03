@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 
 from typing import Literal, overload
 
@@ -7,6 +8,7 @@ import torch
 
 import vllm.envs as envs
 from vllm import _custom_ops as ops
+from vllm.model_executor.layers.fused_moe.ampere import align as sm80_align
 from vllm.triton_utils import triton
 from vllm.utils.math_utils import round_up
 
@@ -223,6 +225,11 @@ def moe_align_block_size(
     """
     if return_scatter_idx and expert_map is not None and not ignore_invalid_experts:
         raise ValueError("scatter_idx with expert_map requires ignore_invalid_experts")
+    aligned = sm80_align.maybe_align(
+        topk_ids, block_size, num_experts, expert_map, pad_sorted_ids,
+        ignore_invalid_experts, return_scatter_idx)
+    if aligned is not None:
+        return aligned
     scatter_idx = None
     if return_scatter_idx:
         scatter_idx = torch.empty(
